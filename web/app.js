@@ -2265,5 +2265,59 @@ window.__sf = { get part() { return part; }, get topo() { return topology; },
                 get drawnWalls() { return drawnWalls; },
                 buildFins, findWallPatches, drawnWall, buildExportGeometry };
 
-const wanted = new URLSearchParams(location.search).get('stl');
+const params = new URLSearchParams(location.search);
+const wanted = params.get('stl');
 if (wanted) loadURL(wanted).catch((err) => console.error('?stl=', err));
+
+// ------------------------------------------------------------ OrcaSlicer mode
+// ?orca is set by the OrcaSlicer plugin (orca-plugin/support_fins.py), which
+// serves this app from a loopback server inside Orca. The part arrives as it sits
+// on Orca's plate, the slicer's layer height / filament / bed seed the controls,
+// and "Send to OrcaSlicer" posts the finned STL back for the plugin to load.
+if (params.has('orca')) initOrca().catch((err) => alert(`OrcaSlicer: ${err.message}`));
+
+async function initOrca() {
+  const s = await (await fetch('/orca/session')).json();
+  if (s.layer_height) el('layer-height').value = s.layer_height;
+  if (s.material) {
+    el('material').value = s.material;
+    applyMaterial(s.material);
+  }
+  if (s.volume) {
+    volumeSelect.value = 'custom';
+    customInputs.forEach((inp, i) => { inp.value = String(s.volume[i]); });
+    volume = { x: s.volume[0], y: s.volume[1], z: s.volume[2] };
+    applyVolume();
+  }
+  if (!s.objects.length) throw new Error('the plate is empty -- add a part first');
+
+  const pick = el('orca-object');
+  s.objects.forEach((o, i) => pick.add(new Option(o.name, String(i))));
+  pick.hidden = s.objects.length < 2;
+  // the last path segment is what loadURL names the part, so give it the Orca name
+  const load = () => loadURL(
+    `/orca/mesh/${pick.value}/${encodeURIComponent(s.objects[Number(pick.value)].name)}.stl`);
+  pick.addEventListener('change', load);
+  await load();
+
+  // room in the topbar for the Orca controls; the web-only chrome has no job here
+  for (const n of document.querySelectorAll('#topbar .badge, #topbar .kofi')) n.hidden = true;
+  const send = el('to-orca');
+  send.hidden = false;
+  send.addEventListener('click', async () => {
+    const g = buildExportGeometry();
+    if (!g) return;
+    send.disabled = true;
+    try {
+      const res = await fetch(`/orca/result?name=${encodeURIComponent(g.base)}`, {
+        method: 'POST', body: writeBinarySTL([...g.partTris, ...g.finTris], g.base) });
+      const msg = await res.text();
+      if (!res.ok) throw new Error(msg);
+      alert(msg);
+    } catch (err) {
+      alert(`Could not send to OrcaSlicer: ${err.message}`);
+    } finally {
+      send.disabled = false;
+    }
+  });
+}

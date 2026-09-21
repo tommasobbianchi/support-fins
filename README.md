@@ -86,6 +86,26 @@ Tests (Deno for the JS engine):
 deno test --allow-read tests/
 ```
 
+## The OrcaSlicer plugin
+
+`orca-plugin/` runs Support Fins inside OrcaSlicer, on builds with the Python plugin system
+(Plugins in the top-bar menu). It uses the same fin engine as the web app, unchanged.
+
+```bash
+orca-plugin/install.sh                 # or: orca-plugin/install.sh <orca datadir>
+```
+
+Restart Orca, orient the part on the plate, then open the menu → **Plugins** → Support Fins → ▷.
+The editor opens on the part as it sits on the plate, with the layer height (tine height), the
+filament (PLA/PETG) and the bed size taken from your presets. **Send to OrcaSlicer** puts the
+part with its fins and pad on the plate. The original stays there. Delete it before slicing.
+
+How it works: Orca's plugin API can read meshes but not modify the model. So the plugin serves
+`web/` and the plate meshes from a loopback server to the plugin window. It saves the finned STL
+under `<datadir>/support_fins/` and loads it the way a second Orca launch would: D-Bus
+`AnotherInstance` on Linux, `WM_COPYDATA` on Windows, `open -a` on macOS. Only the Linux path
+has been run for real; the other two follow Orca's receiving code. Test: `python3 orca-plugin/test_support_fins.py`.
+
 ## The PrusaSlicer plugin (exploratory — not currently working)
 
 **Status: exploratory. This does not currently work — treat it as a research spike, not a
@@ -106,6 +126,7 @@ yet. Kept in the repo for reference only. Use the browser app instead. See `plug
 
 ```
 web/         the browser app (live at printfins.com)
+orca-plugin/ OrcaSlicer plugin: runs the web app on the plate object
 plugin/      native PrusaSlicer 3.0 plugin (exploratory — not working)
 prototype/   Python/trimesh proof of concept the engine was ported from
 docs/        FIN-SPEC.md — the verified fin geometry, with sources
