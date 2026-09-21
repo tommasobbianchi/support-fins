@@ -88,8 +88,17 @@ deno test --allow-read tests/
 
 ## The OrcaSlicer plugin
 
+> **Credits.** Support Fins (the app, the fin engine, everything in `web/`) is by
+> **Matthew Trahan**: [gittrahan/support-fins](https://github.com/gittrahan/support-fins),
+> [printfins.com](https://printfins.com), [Ko-fi](https://ko-fi.com/matthewtrahan). The
+> designed-in support fin technique it automates is **[Slant 3D](https://www.slant3d.com)**'s.
+> The OrcaSlicer port in `orca-plugin/` is by Tommaso Bianchi.
+
 `orca-plugin/` runs Support Fins inside OrcaSlicer, on builds with the Python plugin system
-(Plugins in the top-bar menu). It uses the same fin engine as the web app, unchanged.
+(Plugins in the top-bar menu; OrcaSlicer nightlies). It uses the same fin engine as the web app,
+unchanged.
+
+Install it from **Orca Cloud** (Plugins, search "Support Fins", Subscribe), or from a checkout:
 
 ```bash
 orca-plugin/install.sh                 # or: orca-plugin/install.sh <orca datadir>
@@ -104,7 +113,10 @@ How it works: Orca's plugin API can read meshes but not modify the model. So the
 `web/` and the plate meshes from a loopback server to the plugin window. It saves the finned STL
 under `<datadir>/support_fins/` and loads it the way a second Orca launch would: D-Bus
 `AnotherInstance` on Linux, `WM_COPYDATA` on Windows, `open -a` on macOS. Only the Linux path
-has been run for real; the other two follow Orca's receiving code. Test: `python3 orca-plugin/test_support_fins.py`.
+has been run for real; the other two follow Orca's receiving code. Orca Cloud gets one
+self-contained file, `dist/support_fins_any.py` from `python3 orca-plugin/build.py` (web/
+embedded, unpacked under the data directory on first run); every GitHub release publishes it
+(`.github/workflows/publish-orcacloud.yml`). Test: `python3 orca-plugin/test_support_fins.py`.
 
 ## The PrusaSlicer plugin (exploratory — not currently working)
 

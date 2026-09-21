@@ -4,11 +4,16 @@
 #
 # [tool.orcaslicer.plugin]
 # name = "Support Fins"
-# description = "Adds breakaway support fins, grip tines and a bed pad to a part as it sits on the plate, baked into the mesh. Opens the Support Fins editor on the plate object, then loads the finned part back onto the plate."
-# author = "Support Fins"
+# description = "Adds breakaway support fins, grip tines and a bed pad to a part as it sits on the plate, baked into the mesh, then loads the finned part back onto the plate. Support Fins is by Matthew Trahan (github.com/gittrahan/support-fins, printfins.com); the designed-in fin technique is Slant 3D's. OrcaSlicer port by Tommaso Bianchi."
+# author = "Matthew Trahan (gittrahan), Slant 3D technique; Orca port by Tommaso Bianchi"
 # version = "0.1.0"
 # ///
 """Support Fins for OrcaSlicer.
+
+Credits: Support Fins -- the app, its fin engine and everything in web/ -- is by
+Matthew Trahan (https://github.com/gittrahan/support-fins, MIT). The technique it
+automates, breakaway support fins designed into the part, is Slant 3D's. This file
+is only the OrcaSlicer port (Tommaso Bianchi).
 
 The fin engine is the browser app in web/ (the same code as printfins.com), run
 unchanged inside Orca's plugin webview. The host API is read-only, so:
@@ -38,6 +43,10 @@ except ImportError:          # imported by the offline test
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(HERE, "web")
+
+# The OrcaCloud build (build.py) is a single file, so it carries web/ here as a
+# base64 zip and unpacks it under the data directory on first run.
+_WEB_ZIP = ""
 
 
 def _log(msg):
@@ -293,6 +302,19 @@ def out_dir():
     return d
 
 
+def web_root():
+    """web/ beside this file (repo / install.sh), else the embedded copy, unpacked."""
+    if os.path.isfile(os.path.join(WEB, "index.html")) or not _WEB_ZIP:
+        return WEB
+    import base64, io, zipfile, zlib
+    d = os.path.join(out_dir(), "web-%08x" % zlib.crc32(_WEB_ZIP.encode()))
+    if not os.path.isfile(os.path.join(d, "index.html")):
+        tmp = d + ".tmp"
+        zipfile.ZipFile(io.BytesIO(base64.b64decode(_WEB_ZIP))).extractall(tmp)
+        os.replace(tmp, d)    # a half-extracted copy is never served
+    return d
+
+
 # ------------------------------------------------------------------ server
 
 class Session:
@@ -401,7 +423,7 @@ if orca is not None:
                 self.win.close()
             if self.srv is not None:
                 self.srv.shutdown()
-            self.srv = serve(Session(objects, slicer_settings(), load_in_orca))
+            self.srv = serve(Session(objects, slicer_settings(), load_in_orca), web_root())
             _log("serving %d object(s) on port %d" % (len(objects), self.srv.server_port))
             self.win = orca.host.ui.create_window(
                 html=REDIRECT % self.srv.server_port, title="Support Fins",

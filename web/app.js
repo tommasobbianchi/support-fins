@@ -2300,8 +2300,14 @@ async function initOrca() {
   pick.addEventListener('change', load);
   await load();
 
-  // room in the topbar for the Orca controls; the web-only chrome has no job here
-  for (const n of document.querySelectorAll('#topbar .badge, #topbar .kofi')) n.hidden = true;
+  // the part comes from the plate and goes back to it: no file open, no 3MF export
+  el('file').closest('label').hidden = true;
+  el('export-3mf').hidden = true;
+  // "runs entirely in your browser" isn't true here: the badge carries the credit instead
+  const badge = document.querySelector('#topbar .badge');
+  badge.textContent = 'by Matthew Trahan · fin technique: Slant 3D';
+  badge.title = 'Support Fins by Matthew Trahan (github.com/gittrahan/support-fins). '
+    + 'Designed-in support fins are Slant 3D\'s technique. OrcaSlicer port by Tommaso Bianchi.';
   const send = el('to-orca');
   send.hidden = false;
   send.addEventListener('click', async () => {

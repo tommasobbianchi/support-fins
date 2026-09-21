@@ -1,0 +1,50 @@
+# Every GitHub release publishes the OrcaSlicer plugin to Orca Cloud.
+# The hub identifies the run by an OIDC token GitHub signs, so there is no secret
+# here. Needs this repository connected under Edit plugin > GitHub publishing on
+# cloud.orcaslicer.com (https://cloud.orcaslicer.com/wiki/#publish-from-github).
+name: Publish to OrcaCloud
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The hub takes the version from the tag, not from the file: refuse a mismatch
+      # rather than ship the wrong code under a new version number.
+      - name: Check the tag matches the PEP 723 version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          header="$(sed -n 's/^# version = "\(.*\)"$/\1/p' orca-plugin/support_fins.py | head -1)"
+          echo "tag=$tag header=$header"
+          [ "$tag" = "$header" ]
+
+      # One self-contained file (web/ embedded), "_any" = every OS.
+      - name: Build the single-file plugin
+        run: python3 orca-plugin/build.py
+
+      - name: Publish release to OrcaCloud
+        run: |
+          set -euo pipefail
+          oidc_token="$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=orcacloud" | jq -r .value)"
+          version="${GITHUB_REF_NAME#v}"
+          changelog="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH" | head -c 4000)"
+          metadata="$(jq -cn --arg version "$version" --arg changelog "$changelog" \
+            '{version: $version} + (if $changelog == "" then {} else {changelog: $changelog} end)')"
+          status="$(curl -sS -o response.json -w '%{http_code}' \
+            -H "Authorization: Bearer $oidc_token" \
+            -F "metadata=$metadata" -F "files=@dist/support_fins_any.py" \
+            https://api.orcaslicer.com/api/v1/plugin-publish/releases)"
+          cat response.json
+          echo
+          [ "$status" = "201" ]
