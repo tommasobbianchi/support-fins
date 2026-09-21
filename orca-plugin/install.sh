@@ -15,7 +15,7 @@ cp -r "$here/../web" "$dest/web"
   "capabilities": [{ "Support Fins": true }],
   "enabled": true,
   "installed_from": "local",
-  "installed_version": "0.1.0",
+  "installed_version": "0.1.1",
   "plugin_name": "Support Fins"
 }
 JSON
