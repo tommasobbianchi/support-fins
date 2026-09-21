@@ -39,11 +39,12 @@ jobs:
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=orcacloud" | jq -r .value)"
           version="${GITHUB_REF_NAME#v}"
           changelog="$(jq -r '.release.body // ""' "$GITHUB_EVENT_PATH" | head -c 4000)"
-          metadata="$(jq -cn --arg version "$version" --arg changelog "$changelog" \
-            '{version: $version} + (if $changelog == "" then {} else {changelog: $changelog} end)')"
+          # From a file: inline, curl -F splits the value at any ";" in the release notes.
+          jq -cn --arg version "$version" --arg changelog "$changelog" \
+            '{version: $version} + (if $changelog == "" then {} else {changelog: $changelog} end)' > metadata.json
           status="$(curl -sS -o response.json -w '%{http_code}' \
             -H "Authorization: Bearer $oidc_token" \
-            -F "metadata=$metadata" -F "files=@dist/support_fins_any.py" \
+            -F "metadata=<metadata.json" -F "files=@dist/support_fins_any.py" \
             https://api.orcaslicer.com/api/v1/plugin-publish/releases)"
           cat response.json
           echo
