@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Bundle the web app for the OrcaSlicer dock panel.
 
-  python3 orca-plugin/build_web.py   # -> orca-plugin/build/web/{app,finworker,stepworker}.js
+  python3 orca-plugin/build_web.py
+    -> orca-plugin/build/web/{app,finworker,stepworker}.js
+    -> orca-plugin/build/panel.html   (the whole page, ready to inline into a dock panel)
 
 Duck-types the esbuild invocation in plugins/shared/bundle.py (same version pin,
 same env/PATH resolution). Unlike the engine bundle, this app has a bare-specifier
@@ -9,30 +11,20 @@ import ("three", "three/addons/*") that index.html normally resolves with an imp
 map to web/vendor/three -- esbuild has no import maps, so we pass the same two
 mappings as --alias.
 
-Outputs (all in orca-plugin/build/web/, gitignored like the other plugins' build/):
-  app.js        IIFE bundle of web/app.js (the whole page; run it inside a
-                document that has index.html's body + style.css inlined).
-  finworker.js  classic (non-module) bundle of web/finworker.js. The page
-                instantiates it from its bytes:
-                  new Worker(URL.createObjectURL(
-                    new Blob([FINWORKER_JS], { type: "text/javascript" })))
-                (the source uses `type: "module"`; esbuild bundles the module
-                graph into one classic script, so the Blob must be a plain
-                classic worker and the page must not pass type:"module").
-  stepworker.js  NOT a valid bundle -- see below. web/stepworker.js is a CLASSIC
-                worker whose first statement is
-                  importScripts('./vendor/occt-import-js-0.0.23/occt-import-js.js')
-                esbuild cannot rewrite importScripts, so bundling it produces
-                `importScripts` (not a real function) plus an unresolved './vendor/...'.
-                Orca mode never calls it (the part comes from the plate as STL;
-                the file input + STEP/3MF paths live only in web/ui/io.js's file
-                handler, which initOrca() hides). This script still emits the
-                source verbatim (plus the vendored occt assets under vendor/) so
-                a later phase can serve both from the plugin and swap them for a
-                Blob:URL worker if STEP import ever needs to work in-panel.
+Bundles (all in orca-plugin/build/web/, gitignored like the other plugins' build/):
+  app.js        IIFE bundle of web/app.js (the whole page).
+  finworker.js  classic (non-module) bundle of web/finworker.js; the page
+                instantiates it from its source string via a Blob URL worker.
+  stepworker.js source emitted verbatim (see docstring) + vendored OCCT assets.
+
+panel.html is plain string composition, no templating engine: index.html's body
+markup (importmap + module scripts stripped) + style.css inlined + the finworker
+bundle as window.__SF_FINWORKER__ + the app.js bundle, self-contained.
 """
+import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -76,7 +68,46 @@ def build():
     if not vendor_out.exists():
         shutil.copytree(OCCT, vendor_out)
     print(f"emitted {OUT / 'stepworker.js'} (source verbatim) + vendored {OCCT.name}/")
+    compose_panel()
     return OUT
+
+
+def _body_markup():
+    """The <body> contents of web/index.html without the importmap + module scripts."""
+    html = (WEB / "index.html").read_text(encoding="utf-8")
+    body = re.search(r"<body[^>]*>(.*)</body>", html, re.S).group(1)
+    # drop the ES-module bootstrap script tags (the bundle replaces them)
+    body = re.sub(r'<script\b[^>]*type="module"[^>]*></script>', "", body)
+    body = re.sub(r'<script\b[^>]*src="\./app\.js"[^>]*></script>', "", body)
+    assert 'type="importmap"' not in body, "importmap leaked into the panel body"
+    return body.lstrip("\n").rstrip("\n")
+
+
+def _js_inlined(src):
+    """Make a JavaScript source string safe to embed verbatim inside a <script> tag."""
+    assert "</script" not in src.lower(), src[:120]
+    return src
+
+
+def compose_panel():
+    style = (WEB / "style.css").read_text(encoding="utf-8")
+    finworker = _js_inlined((OUT / "finworker.js").read_text(encoding="utf-8"))
+    app = _js_inlined((OUT / "app.js").read_text(encoding="utf-8"))
+    # the page reads window.__SF_FINWORKER__ (the finworker source string) to make
+    # its Blob-URL worker; json.dumps is the escaping boundary, and any literal
+    # </script inside it would close the tag early, so forbid it.
+    fin = json.dumps(finworker)
+    assert "</script" not in fin.lower()
+    body = _body_markup()
+    page = (
+        '<!doctype html><html><head><meta charset="utf-8"><title>Support Fins</title>'
+        + "<style>" + style + "</style>"
+        + "<script>window.__SF_FINWORKER__ = " + fin + ";</script></head>"
+        + "<body>" + body + "<script>" + app + "</script></body></html>"
+    )
+    out = HERE / "build" / "panel.html"
+    out.write_text(page, encoding="utf-8")
+    print(f"composed {out} ({out.stat().st_size / 1024:.0f} KB)")
 
 
 if __name__ == "__main__":

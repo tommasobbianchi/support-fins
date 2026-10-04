@@ -169,13 +169,16 @@ The editor opens on the part as it sits on the plate, with the layer height (tin
 filament (PLA/PETG) and the bed size taken from your presets. **Send to OrcaSlicer** puts the
 part with its fins and pad on the plate. The original stays there. Delete it before slicing.
 
-How it works: Orca's plugin API can read meshes but not modify the model. So the plugin serves
-`web/` and the plate meshes from a loopback server to the plugin window. It saves the finned STL
-under `<datadir>/support_fins/` and loads it the way a second Orca launch would: D-Bus
-`AnotherInstance` on Linux, `WM_COPYDATA` on Windows, `open -a` on macOS. Only the Linux path
-has been run for real; the other two follow Orca's receiving code. Orca Cloud gets one
-self-contained file, `dist/support_fins_any.py` from `python3 orca-plugin/build.py` (web/
-embedded, unpacked under the data directory on first run); every GitHub release publishes it
+How it works: Orca's plugin API can read meshes but not modify the model. So the plugin opens the
+fin app in a **dock panel** beside the 3D view (no loopback server, no socket, no WebView2
+dependency), and the two sides talk over Orca's message bridge. The page posts `{ready}` once its
+listener is armed; the plugin replies with the session — the plate meshes (base64 STL) plus the
+slicer settings the fins depend on. **Send to OrcaSlicer** sends the finned STL back over the same
+bridge; the plugin saves it under `<datadir>/support_fins/` and loads it the way a second Orca
+launch would: D-Bus `AnotherInstance` on Linux, `WM_COPYDATA` on Windows, `open -a` on macOS.
+Only the Linux path has been run for real; the other two follow Orca's receiving code. Orca Cloud
+gets one self-contained file, `dist/support_fins_any.py` from `python3 orca-plugin/build.py`
+(web/ composed and embedded as a single page); every GitHub release publishes it
 (`.github/workflows/publish-orcacloud.yml`). Test: `python3 orca-plugin/test_support_fins.py`.
 
 ## The PrusaSlicer plugin (hand-placed)

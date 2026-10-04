@@ -200,6 +200,9 @@ if (window.orca && typeof window.orca.onMessage === 'function') {
       alert(msg.detail);
     }
   });
+  // tell the plugin the listener is armed; it then posts the session (a race
+  // would lose it if it had been sent before this).
+  window.orca.postMessage({ command: 'ready' });
 }
 
 async function initOrca(session, objects) {

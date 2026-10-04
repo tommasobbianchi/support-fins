@@ -5,10 +5,13 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 datadir=${1:-"$HOME/.config/OrcaSlicer"}
 dest="$datadir/orca_plugins/support_fins"
-mkdir -p "$dest"
+mkdir -p "$dest/build"
+# The plugin opens a composed, self-contained page (no loopback server): build it
+# from web/ + the bundles if it is not there yet, and install it beside the plugin.
+[ -f "$here/build/panel.html" ] || python3 "$here/build_web.py"
 cp "$here/support_fins.py" "$dest/"
-rm -rf "$dest/web"
-cp -r "$here/../web" "$dest/web"
+cp "$here/build/panel.html" "$dest/build/"
+rm -rf "$dest/web"          # the loopback server is gone; drop any old web/ copy
 # Orca only lists a side-loaded plugin that has an install record beside it.
 [ -f "$dest/.install_state.json" ] || cat > "$dest/.install_state.json" <<JSON
 {

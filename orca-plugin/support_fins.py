@@ -16,25 +16,27 @@ automates, breakaway support fins designed into the part, is Slant 3D's. This fi
 is only the OrcaSlicer port (Tommaso Bianchi).
 
 The fin engine is the browser app in web/ (the same code as printfins.com), run
-unchanged inside Orca's plugin webview. The host API is read-only, so:
+unchanged inside Orca's dock panel. The host API is read-only, so:
 
   1. the plate objects' meshes are read through orca.host.model, with their
      instance/volume transforms applied, so the part arrives as oriented in Orca;
-  2. a loopback HTTP server serves web/, those meshes, and the slicer settings the
+  2. a self-contained page (style + bundles composed by build_web.py, embedded by
+     build.py in the single-file artifact) is opened in a dock panel beside the
+     3D view. The page posts {command: "ready"} once its listener is armed, and the
+     plugin replies with the session -- those meshes plus the slicer settings the
      fins depend on (layer height -> tine height, filament -> PLA/PETG, bed size);
-  3. "Send to OrcaSlicer" POSTs the finned STL back, which is written under the
-     data directory and loaded onto the plate the way a second launch would.
+  3. "Send to OrcaSlicer" posts the finned STL back over the same bridge, which is
+     written under the data directory and loaded onto the plate the way a second
+     launch would.
 """
-import functools
+import base64
+import gzip
 import json
 import os
 import re
 import struct
 import subprocess
 import sys
-import threading
-import urllib.parse
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 try:
     import orca
@@ -44,9 +46,10 @@ except ImportError:          # imported by the offline test
 HERE = os.path.dirname(os.path.abspath(__file__))
 WEB = os.path.join(HERE, "web")
 
-# The OrcaCloud build (build.py) is a single file, so it carries web/ here as a
-# base64 zip and unpacks it under the data directory on first run.
-_WEB_ZIP = ""
+# The OrcaCloud build (build.py) composes web/ into one self-contained page and
+# embeds it here (gzip + base64) on the placeholder line below. The checkout
+# path (install.sh) instead reads orca-plugin/build/panel.html next to this file.
+EMBEDDED_PANEL_HTML_GZ_B64 = ""
 
 
 def _log(msg):
@@ -302,102 +305,22 @@ def out_dir():
     return d
 
 
-def web_root():
-    """web/ beside this file (repo / install.sh), else the embedded copy, unpacked."""
-    if os.path.isfile(os.path.join(WEB, "index.html")) or not _WEB_ZIP:
-        return WEB
-    import base64, io, zipfile, zlib
-    d = os.path.join(out_dir(), "web-%08x" % zlib.crc32(_WEB_ZIP.encode()))
-    if not os.path.isfile(os.path.join(d, "index.html")):
-        tmp = d + ".tmp"
-        zipfile.ZipFile(io.BytesIO(base64.b64decode(_WEB_ZIP))).extractall(tmp)
-        os.replace(tmp, d)    # a half-extracted copy is never served
-    return d
-
-
-# ------------------------------------------------------------------ server
-
-class Session:
-    """What one editor window works on: a snapshot of the plate at open time."""
-
-    def __init__(self, objects, settings, deliver):
-        self.objects = objects        # [(name, stl bytes)]
-        self.settings = settings
-        self.deliver = deliver        # path -> (ok, detail)
-
-
-class Handler(SimpleHTTPRequestHandler):
-    session = None
-
-    def log_message(self, fmt, *args):
-        pass
-
-    def end_headers(self):
-        self.send_header("Cache-Control", "no-store")   # a plugin update must show at once
-        super().end_headers()
-
-    def _reply(self, code, body, ctype="text/plain; charset=utf-8"):
-        body = body if isinstance(body, bytes) else body.encode()
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self):
-        s, path = self.session, urllib.parse.urlparse(self.path).path
-        if path == "/orca/session":
-            info = dict(s.settings, objects=[{"name": n} for n, _ in s.objects])
-            return self._reply(200, json.dumps(info), "application/json")
-        m = re.fullmatch(r"/orca/mesh/(\d+)/[^/]*\.stl", path)
-        if m:
-            i = int(m.group(1))
-            if i >= len(s.objects):
-                return self._reply(404, "no such object")
-            return self._reply(200, s.objects[i][1], "model/stl")
-        return super().do_GET()
-
-    def do_POST(self):
-        u = urllib.parse.urlparse(self.path)
-        if u.path != "/orca/result":
-            return self._reply(404, "not found")
-        data = self.rfile.read(int(self.headers.get("Content-Length", 0)))
-        if len(data) < 84:
-            return self._reply(400, "empty STL")
-        name = urllib.parse.parse_qs(u.query).get("name", ["part"])[0]
-        name = re.sub(r"[^\w.\- ]", "_", name).strip() or "part"
-        path = os.path.join(out_dir(), name + "-fins.stl")
-        with open(path, "wb") as fh:
-            fh.write(data)
-        ok, detail = self.session.deliver(path)
-        _log("result %s (%d bytes) -> %s %s" % (path, len(data), ok, detail))
-        if ok:
-            return self._reply(200, "Loaded onto the plate: %s\n\nThe original part is still "
-                                    "there -- delete it before slicing." % os.path.basename(path))
-        return self._reply(500, "Saved %s but could not load it (%s)." % (path, detail))
-
-
-def serve(session, web=WEB):
-    """Start a loopback server for `session`; returns the server (port in .server_port)."""
-    handler = functools.partial(type("H", (Handler,), {"session": session}), directory=web)
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv
-
-
-# The plugin window is loaded with SetPage (file:// base), so it just hops to the
-# loopback server, where the ES modules and the fin worker load as on the web.
-REDIRECT = """<!doctype html><meta charset="utf-8">
-<body style="background:#0d1117;color:#8b949e;font:14px system-ui;padding:24px">
-Opening Support Fins…
-<script>location.replace("http://127.0.0.1:%d/index.html?orca=1");</script>"""
+def _panel_html():
+    """The dock-panel page: embedded (single-file build) or composed in the checkout."""
+    if EMBEDDED_PANEL_HTML_GZ_B64:
+        return gzip.decompress(base64.b64decode(EMBEDDED_PANEL_HTML_GZ_B64)).decode("utf-8")
+    dev = os.path.join(HERE, "build", "panel.html")
+    if not os.path.isfile(dev):
+        raise RuntimeError("no dock-panel page; run `python3 orca-plugin/build_web.py` "
+                           "(or build the single-file plugin with `python3 orca-plugin/build.py`)")
+    return open(dev, encoding="utf-8").read()
 
 
 if orca is not None:
 
     class SupportFinsScript(orca.script.ScriptPluginCapabilityBase):
-        win = None
-        srv = None
+        panel = None
+        _session = None
 
         def get_name(self):
             return "Support Fins"
@@ -412,30 +335,70 @@ if orca is not None:
                 if len(tris):
                     # Orca names an object after its file; the result gets "-fins.stl" added
                     name = re.sub(r"\.(stl|3mf|obj|stp|step|amf)$", "", obj.name or "", flags=re.I) or "part"
-                    objects.append((name, stl_bytes(tris, name)))
+                    objects.append({"name": name,
+                                    "stl": base64.b64encode(stl_bytes(tris, name)).decode()})
             if not objects:
                 orca.host.ui.message("Add a part to the plate first, orient it the way you "
                                      "want to print it, then run Support Fins.",
                                      "Support Fins", "ok", "warning")
                 return orca.ExecutionResult.skipped("empty plate")
 
-            if self.win is not None and self.win.is_open():
-                self.win.close()
-            if self.srv is not None:
-                self.srv.shutdown()
-            self.srv = serve(Session(objects, slicer_settings(), load_in_orca), web_root())
-            _log("serving %d object(s) on port %d" % (len(objects), self.srv.server_port))
-            self.win = orca.host.ui.create_window(
-                html=REDIRECT % self.srv.server_port, title="Support Fins",
-                width=1400, height=900, on_close=self.on_close)
+            if not hasattr(orca.host.ui, "create_dock_panel"):
+                orca.host.ui.message("This OrcaSlicer is too old for the Support Fins panel "
+                                     "(orca.host.ui.create_dock_panel is missing). Update "
+                                     "OrcaSlicer and try again.",
+                                     "Support Fins", "ok", "warning")
+                return orca.ExecutionResult.skipped("OrcaSlicer lacks create_dock_panel")
+
+            self._session = {"command": "session", "session": slicer_settings(), "objects": objects}
+            if self.panel is not None and self.panel.is_open():
+                self.panel.post(self._session)            # refresh the open panel in place
+            else:
+                self.panel = orca.host.ui.create_dock_panel(
+                    html=_panel_html(), title="Support Fins",
+                    width=1400, height=900,
+                    on_message=self.on_message, on_close=self.on_close, dock="right")
+                self.panel.show()
+                # Not posted now: the page's onMessage may not be armed when the panel
+                # loads, and a session posted early would be dropped. The page posts
+                # {command: "ready"} once it is listening, and on_message re-sends it.
+            _log("panel refreshed with %d object(s)" % len(objects))
             return orca.ExecutionResult.success()
 
+        def on_message(self, message):
+            command = (message or {}).get("command")
+            if command == "ready":
+                # The page's onMessage is armed; hand it the session we withheld
+                # at create_dock_panel time. A stale ready after a close is a no-op.
+                if self._session is not None and self.panel is not None:
+                    self.panel.post(self._session)
+                return
+            if command != "result":
+                return
+            name = re.sub(r"[^\w.\- ]", "_", message.get("name") or "").strip() or "part"
+            try:
+                data = base64.b64decode(message.get("b64") or "")
+                if len(data) < 84:
+                    raise ValueError("empty STL")
+                path = os.path.join(out_dir(), name + "-fins.stl")
+                with open(path, "wb") as fh:
+                    fh.write(data)
+            except Exception as e:
+                _log("result unreadable: %r" % e)
+                self.panel.post({"command": "loaded", "ok": False,
+                                "detail": "Could not read the finned part (%s)." % e})
+                return
+            ok, detail = load_in_orca(path)
+            _log("result %d bytes -> %s %s" % (len(data), path, detail))
+            if ok:
+                detail = ("Loaded onto the plate: %s\n\nThe original part is still "
+                          "there -- delete it before slicing." % os.path.basename(path))
+            else:
+                detail = "Saved %s but could not load it (%s)." % (os.path.basename(path), detail)
+            self.panel.post({"command": "loaded", "ok": ok, "detail": detail})
+
         def on_close(self):
-            self.win = None
-            if self.srv is not None:
-                # shutdown() blocks until serve_forever returns, so not on the UI thread
-                threading.Thread(target=self.srv.shutdown, daemon=True).start()
-                self.srv = None
+            self.panel = None
 
     @orca.plugin
     class SupportFinsPlugin(orca.base):
