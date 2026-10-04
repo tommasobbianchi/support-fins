@@ -52,6 +52,13 @@ export function applyVolume() {
   if (part) shade();
 }
 
+export function setVolume(x, y, z) {
+  volume = { x, y, z };
+  volumeSelect.value = 'custom';
+  customInputs.forEach((inp, i) => { inp.value = String([x, y, z][i]); });
+  applyVolume();
+}
+
 volumeSelect.addEventListener('change', () => {
   if (volumeSelect.value !== 'custom') {
     volume = VOLUMES.find((v) => volLabel(v) === volumeSelect.value) ?? volume;

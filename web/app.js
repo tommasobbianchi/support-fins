@@ -23,7 +23,8 @@ import {
 } from './ui/remove.js';
 import { undo, redo } from './ui/history.js';
 import { loadURL } from './ui/io.js';
-import { applyVolume } from './ui/volume.js';
+import { writeBinarySTL } from './stl.js';
+import { applyVolume, setVolume } from './ui/volume.js';
 import { buildExportGeometry } from './ui/export.js';
 import './ui/plugins.js';
 import { updateReadout } from './ui/readout.js';
@@ -32,7 +33,7 @@ import {
   selectWall, removeSelected, drawHover, drawClick,
 } from './ui/walls.js';
 import { finTris, padTris, lastBuilt } from './ui/finbuild.js';
-import { initSettings } from './ui/settings.js';
+import { initSettings, applyMaterial } from './ui/settings.js';
 import { part, topology, rotM3, lastResult, threshold } from './ui/part.js';
 import { gizmo, hoverFace, layActive, cancelLay, layHover, layClick } from './ui/pose.js';
 
@@ -197,12 +198,7 @@ async function initOrca() {
     el('material').value = s.material;
     applyMaterial(s.material);
   }
-  if (s.volume) {
-    volumeSelect.value = 'custom';
-    customInputs.forEach((inp, i) => { inp.value = String(s.volume[i]); });
-    volume = { x: s.volume[0], y: s.volume[1], z: s.volume[2] };
-    applyVolume();
-  }
+  if (s.volume) setVolume(s.volume[0], s.volume[1], s.volume[2]);
   if (!s.objects.length) throw new Error('the plate is empty -- add a part first');
 
   const pick = el('orca-object');
@@ -216,6 +212,7 @@ async function initOrca() {
 
   // the part comes from the plate and goes back to it: no file open, no 3MF export
   el('file').closest('label').hidden = true;
+  el('plugins').closest('.plugins-wrap').hidden = true;
   el('export-3mf').hidden = true;
   // "runs entirely in your browser" isn't true here: the badge carries the credit instead
   const badge = document.querySelector('#topbar .badge');

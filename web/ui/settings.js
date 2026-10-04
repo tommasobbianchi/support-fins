@@ -165,7 +165,7 @@ el('cutout').addEventListener('change', () => {
 // profile + rebuilding is all it takes.
 export let materialDensity = MATERIAL.pla.density;
 
-function applyMaterial(name) {
+export function applyMaterial(name) {
   const m = MATERIAL[name] || MATERIAL.pla;
   FIN.padH = m.padH;
   PAD.grab = m.padGrab;
