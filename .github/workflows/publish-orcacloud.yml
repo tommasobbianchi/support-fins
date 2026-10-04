@@ -28,7 +28,11 @@ jobs:
           echo "tag=$tag header=$header"
           [ "$tag" = "$header" ]
 
-      # One self-contained file (web/ embedded), "_any" = every OS.
+      # The build bundles the app with esbuild (orca-plugin/build_web.py) and
+      # embeds the composed page: one self-contained file, "_any" = every OS.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'      # npx fetches the pinned esbuild
       - name: Build the single-file plugin
         run: python3 orca-plugin/build.py
 

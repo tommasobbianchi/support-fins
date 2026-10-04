@@ -18,7 +18,7 @@ rm -rf "$dest/web"          # the loopback server is gone; drop any old web/ cop
   "capabilities": [{ "Support Fins": true }],
   "enabled": true,
   "installed_from": "local",
-  "installed_version": "0.1.1",
+  "installed_version": "0.2.0",
   "plugin_name": "Support Fins"
 }
 JSON

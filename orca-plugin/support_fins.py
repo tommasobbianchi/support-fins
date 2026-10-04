@@ -6,7 +6,7 @@
 # name = "Support Fins"
 # description = "Adds breakaway support fins, grip tines and a bed pad to a part as it sits on the plate, baked into the mesh, then loads the finned part back onto the plate. Support Fins is by Matthew Trahan (github.com/gittrahan/support-fins, printfins.com); the designed-in fin technique is Slant 3D's. OrcaSlicer port by Tommaso Bianchi."
 # author = "Matthew Trahan (gittrahan), Slant 3D technique; Orca port by Tommaso Bianchi"
-# version = "0.1.1"
+# version = "0.2.0"
 # ///
 """Support Fins for OrcaSlicer.
 
