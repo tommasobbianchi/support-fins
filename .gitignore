@@ -33,3 +33,6 @@ plugins/freecad/build/
 plugins/blender/build/
 # user-reported parts (other people's files): measured locally, never committed
 prototype/examples/reports/
+
+# orca-plugin: bundles produced by build_web.py (rebuilt from source)
+orca-plugin/build/

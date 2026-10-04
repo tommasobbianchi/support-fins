@@ -119,7 +119,7 @@ function pickObjects(objects) {
  * position array STLLoader produces, so everything downstream (setPart, the
  * weld, the whole engine) is unchanged.
  */
-async function parseModel(buffer) {
+export async function parseModel(buffer) {
   importNote = '';
   if (isStep(buffer)) return parseStep(buffer);
   if (!isZip(buffer)) return loader.parse(buffer);

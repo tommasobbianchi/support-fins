@@ -3,10 +3,14 @@
 Writes dist/support_fins_any.py -- support_fins.py with web/ embedded -- which is
 what OrcaSlicer's plugin hub ships ("_any" = every OS).
 """
-import base64, io, os, zipfile
+import base64, io, os, subprocess, sys, zipfile
 
 here = os.path.dirname(os.path.abspath(__file__))
 web = os.path.join(here, "..", "web")
+
+# produce the bundled app (app.js / finworker.js / stepworker.js) before
+# assembly so a later phase can inline them into the dock panel html.
+subprocess.run([sys.executable, os.path.join(here, "build_web.py")], check=True)
 buf = io.BytesIO()
 with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
     for root, _, files in os.walk(web):
