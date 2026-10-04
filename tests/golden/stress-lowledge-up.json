@@ -1,0 +1,67 @@
+{
+  "scene": {
+    "name": "stress-lowledge-up",
+    "model": "lowledge",
+    "rot": [
+      0,
+      0,
+      0
+    ]
+  },
+  "walls": 3,
+  "tines": 0,
+  "unserved": 0,
+  "triangles": 2616,
+  "padTriangles": 0,
+  "fins": [
+    {
+      "kind": "prop",
+      "height": 0.8,
+      "length": 43,
+      "tines": 0,
+      "from": [
+        -18,
+        -19.4,
+        0.8
+      ],
+      "to": [
+        25,
+        -19.4,
+        0.8
+      ]
+    },
+    {
+      "kind": "prop",
+      "height": 0.8,
+      "length": 43,
+      "tines": 0,
+      "from": [
+        -18,
+        0,
+        0.8
+      ],
+      "to": [
+        25,
+        0,
+        0.8
+      ]
+    },
+    {
+      "kind": "prop",
+      "height": 0.8,
+      "length": 43,
+      "tines": 0,
+      "from": [
+        -18,
+        19.4,
+        0.8
+      ],
+      "to": [
+        25,
+        19.4,
+        0.8
+      ]
+    }
+  ],
+  "sha256": "fcf1825785c159bf3d6b569aaabf603d5323a415301d9c9618f9f2e0c6ae5c97"
+}

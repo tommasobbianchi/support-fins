@@ -16,7 +16,7 @@
 
 import { loadModel, analyze, fins, prop, insidePart, nearestFaceInwardH, rotX, rotY, assert } from './_util.js';
 
-const TINE_BITE = prop.PROP.tineBite;   // how far the nub reaches in -- read from source, don't drift
+const TINE_REACH = prop.PROP.tineReach;   // how far a tine looks for the part -- read from source, don't drift
 
 const CASES = [
   ['plate', rotX(45)], ['plate', rotY(40)], ['plate', rotY(-40)],
@@ -36,7 +36,7 @@ Deno.test('tines on real parts: every tine bites INTO the nearest face, none lie
     const caps = globalThis.__TINECAP;
     for (const c of caps) {
       total++;
-      const bx = c.x + c.biteX * TINE_BITE, by = c.y + c.biteY * TINE_BITE;
+      const bx = c.x + c.biteX * TINE_REACH, by = c.y + c.biteY * TINE_REACH;
       if (!insidePart(topo, rot, res.offset, bx, by, c.z)) { noGrip++; airCases.add(name); }
       const inw = nearestFaceInwardH(topo, rot, res.offset, [c.x, c.y, c.z]);
       if (inw) {
@@ -68,4 +68,27 @@ Deno.test('tines on real parts: every tine bites INTO the nearest face, none lie
   assert(noGrip === 0, `${noGrip}/${total} tines bite AIR (tip not inside the part): ${[...airCases]}`);
   assert(flat === 0, `${flat}/${checked} tines lie FLAT (bite off the face inward normal): ${[...flatCases]}`);
   assert(sparseCases.length === 0, `SPARSE comb (nubs laying on the face, not gripping) -- median tine spacing too wide: ${sparseCases}`);
+});
+
+// BOTTOM-EDGE GRIP. "The fins don't go all the way to the bottom of the part."
+// The tine comb used to start half a step IN from each wall-run end, leaving the
+// lowest ~step/2 of the wall -- the part's bottom edge, where a tilted part peels
+// off first -- with no tine. emitTines now drops a nub hard against each run end,
+// and PROP.baseH (0.6) keeps minTop low enough to admit it. So on a tilted part
+// the lowest tine sits ~1.2mm up (the wall base) instead of the old ~1.95mm floor.
+Deno.test('tines reach the wall base on tilted parts, not a step up (bottom-edge peel fix)', () => {
+  for (const name of ['cube', 'tshape', 'lbracket']) {
+    const topo = loadModel(name);
+    const rot = rotX(45);
+    const res = analyze(topo, 45, rot);
+    globalThis.__TINECAP = [];
+    fins.buildFins(topo, res, rot, { mode: 'auto', bedPad: true });
+    const zs = globalThis.__TINECAP.map((t) => t.z);
+    globalThis.__TINECAP = undefined;
+    assert(zs.length >= 4, `${name}: too few tines to check (${zs.length})`);
+    const lo = Math.min(...zs);
+    // Old floor was ~1.9 (first station at step/2); the base nub lands ~1.2. 1.6
+    // cleanly separates the fixed comb from a regression back to the step/2 inset.
+    assert(lo < 1.6, `${name}: lowest tine ${lo.toFixed(2)}mm -- bottom band ungripped (step/2 inset regressed?)`);
+  }
 });

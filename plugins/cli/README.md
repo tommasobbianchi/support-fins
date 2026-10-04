@@ -1,0 +1,70 @@
+# Support Fins — command line
+
+printfins.com from a terminal: fin one part or a whole folder, then open the results in
+any slicer. It's the answer for Bambu Studio, which has no plugin API: run the parts
+through this, open the 3MFs in Bambu.
+
+Same engine as the site and every plugin (`plugins/shared/engine/computeFins`), and the
+same settings: the flags are generated from `plugins/shared/engine/options.json`.
+
+```
+support-fins part.stl                          # -> part-fins.3mf next to it (part + fins)
+support-fins part.stl --rot 0,35,0             # pose it first: the site's X · Y · Z readout
+support-fins *.stl --material petg --coverage 70
+support-fins part.stl -o out.stl               # one STL with part + fins merged
+support-fins part.stl --fins-only              # part-fins-only.stl, lines up with part.stl
+support-fins plate.3mf --object 2              # a 3MF with several objects: pick one
+support-fins part.stl --json                   # one JSON line per file (stats + summary)
+support-fins --help                            # every setting, with the site's defaults
+```
+
+**Rotation.** The part is finned the way it sits in the file (z up), unless `--rot`
+turns it. `--rot` takes the numbers printfins.com shows under the part ("X 35° · Y 0° ·
+Z 0°" is `--rot 35,0,0`), in the same order (three.js Euler XYZ), so a pose found on
+the site carries over. The output is posed, centred over the origin, and seated on
+z = 0, as the site exports it. `--fins-only` instead lines the fins up with the part as
+it is in your file, so it can't take `--rot`.
+
+A Support Fins 3MF (the site's or this tool's) is refused as input: it already has fins.
+Settings the site would hide (`--sway-reach` without `--sway`) run but warn.
+
+**Settings** are the site's, in the site's units: percent sliders take 0-100
+(`--coverage 70`, `--tine-density 50`), on/off settings are `--sway` / `--no-tines`.
+
+**What it tells you.** One line per file: walls, tines, and anything left unsupported
+(overhangs too shallow for a fin this way up, pieces that start in mid-air). That is a
+report, not a failure: exit 0. Exit 1 = a file couldn't be read or finned (the other
+files still are); exit 2 = bad arguments, nothing ran.
+
+## Running it
+
+The download (printfins.com ▸ Plugins, or `support-fins.mjs` on the `plugins-latest`
+release) is the whole tool in one file:
+
+```
+deno run -RW support-fins.mjs part.stl                 # Deno 2
+node support-fins.mjs part.stl                         # Node 20.10+
+```
+
+From a checkout (`python3 plugins/cli/build.py` makes that file):
+
+```
+deno run -RW plugins/cli/support-fins.js part.stl      # Deno 2
+node plugins/cli/support-fins.js part.stl              # Node 20.10+
+```
+
+Single-file binary (no Deno or Node needed to run it, ~70 MB):
+
+```
+deno compile -RW --include plugins/shared/engine/options.json \
+  -o support-fins plugins/cli/support-fins.js
+```
+
+## Code
+
+- `support-fins.js` — the entry: gives `cli.js` a file system (Deno or Node) and an exit code.
+- `cli.js` — flags, pose, read STL/3MF, `computeFins`, write. No file system of its own.
+- `tests/cli.test.js` — `deno test -A plugins/cli/tests/`. Runs in memory: CLI fins equal
+  `computeFins` on the posed part, and match the website's own path on lbracket@35.
+- The summary line is `plugins/shared/engine/report.js`, word for word with the Python
+  hosts' `host_report`.

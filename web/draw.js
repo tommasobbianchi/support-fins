@@ -12,16 +12,16 @@
  * draws is straight in XY by construction; there is nothing left to snap.
  *
  * Geometry only. The interaction (picking the two endpoints, live preview, undo)
- * lives in app.js; this module turns two surface points plus the part's triangles
- * into a watertight wall, reusing prop.js's proven `sweep` and its three
+ * lives in ui/walls.js; this module turns two surface points plus the part's triangles
+ * into a watertight wall, reusing prop/sweep.js's proven `sweep` and its three
  * line-settling passes verbatim.
  */
-import { PROP, PART_BAND, sweep, sweepBetween, floorLine, contourTop, lowerSag, settleTop, emitTines, tineStepFor } from './prop.js';
+import { PROP, PART_BAND, sweep, sweepBetween, floorLine, moldLine, contourTop, lowerSag, settleTop, emitTines, tineStepFor } from './prop.js';
 
 /**
  * Every surface height directly above (x, y), as a list.
  *
- * `surfaceZAt` in prop.js returns only the LOWEST, which is what an auto-placer
+ * `surfaceZAt` in prop/surface.js returns only the LOWEST, which is what an auto-placer
  * wants (the underside a wall props to). A hand-drawn wall instead wants the
  * surface the user actually clicked, so this keeps them all and the caller picks
  * the one nearest the line the user drew -- otherwise a wall under a shallow
@@ -48,7 +48,7 @@ function surfaceZsAt(tris, x, y) {
  * The contact polyline for a wall drawn from `a` to `b` (both surface points in
  * PRINT space, [x, y, z]). Straight in XY by construction. Each station's height
  * is the part surface nearest the line the user drew -- not the global lowest,
- * which would jump to another feature -- and then the three prop.js passes pull
+ * which would jump to another feature -- and then the three prop/contact.js passes pull
  * the top to a clean `gap` below the part exactly as the auto-placer does.
  */
 export function drawnLine(a, b, tris, step = PROP.stationStep, band = Infinity) {
@@ -114,7 +114,8 @@ export function drawnWall(a, b, tris, zBed = 0, opts = {}) {
     const floor = floorLine(topPA, tris);
     let floorMax = 0;
     for (const p of floor) if (p[2] > floorMax) floorMax = p[2];
-    if (floorMax > PROP.gap + 0.5 && sweepBetween(topPA, floor, out)) {
+    const mold = floorMax > PROP.gap + 0.5 ? moldLine(topPA, tris) : null;
+    if (mold && sweepBetween(mold.top, mold.floor, out)) {
       let height = 0;
       for (let i = 0; i < topPA.length; i++) {
         height = Math.max(height, (topPA[i][2] - PROP.gap) - floor[i][2]);

@@ -24,28 +24,29 @@ import trimesh
 
 WALL_MIN_VOL = 20.0     # mm^3; below this a body is a tine, not a wall or base
 TINE_MAX_VOL = 5.0
+TINE_MAX_H = 0.45   # mm; a tine is one layer (tineH 0.2) -- two layers is already not a tine
 STANDOFF = 0.2
 # The project's own non-fusing clearance, same number as the breakaway gap: if
 # 0.2mm is enough for the part to bridge over the top without welding, it is
-# enough beside a flank. prop.js targets 0.35 so there is margin to lose.
+# enough beside a flank. PROP.sideClear targets 0.35 so there is margin to lose.
 FLANK_MIN = 0.20
 
 # Mirrors web/overhangs.js constant-for-constant, same as spike_overhangs.py.
 OVERHANG_COS = np.cos(np.radians(45)) + 1e-4
 BED_EPS = 0.35
 # One dial, one owner: the generator's PROP.maxUnsupportedSpan is the value,
-# read out of prop.js so the checker cannot drift from it. The literal here is
+# read out of web/prop/config.js (PROP) so the checker cannot drift from it. The literal here is
 # only the fallback if the parse ever fails (and it warns when that happens).
 def _span_from_generator():
     import re, pathlib
-    prop_js = pathlib.Path(__file__).resolve().parent.parent / 'web' / 'prop.js'
+    prop_js = pathlib.Path(__file__).resolve().parent.parent / 'web' / 'prop' / 'config.js'
     try:
         m = re.search(r'maxUnsupportedSpan:\s*([0-9.]+)', prop_js.read_text())
         if m:
             return float(m.group(1))
     except OSError:
         pass
-    print('  ! could not read maxUnsupportedSpan from web/prop.js; using 12.0')
+    print('  ! could not read maxUnsupportedSpan from web/prop/config.js; using 12.0')
     return 12.0
 
 MAX_UNSUPPORTED_SPAN = _span_from_generator()   # mm; the dial M7b exposes
@@ -53,14 +54,14 @@ MAX_UNSUPPORTED_SPAN = _span_from_generator()   # mm; the dial M7b exposes
 
 def _baseh_from_generator():
     import re, pathlib
-    prop_js = pathlib.Path(__file__).resolve().parent.parent / 'web' / 'prop.js'
+    prop_js = pathlib.Path(__file__).resolve().parent.parent / 'web' / 'prop' / 'config.js'
     try:
         m = re.search(r'baseH:\s*([0-9.]+)', prop_js.read_text())
         if m:
             return float(m.group(1))
     except OSError:
         pass
-    print('  ! could not read baseH from web/prop.js; using 1.0')
+    print('  ! could not read baseH from web/prop/config.js; using 1.0')
     return 1.0
 
 
@@ -163,7 +164,13 @@ def check(case):
     pq = trimesh.proximity.ProximityQuery(part)
 
     walls = [b for b in added if b.volume > WALL_MIN_VOL]
-    tines = [b for b in added if b.volume < TINE_MAX_VOL]
+    # A tine is ONE LAYER tall by design (PROP.tineH) -- so small AND flat.
+    # Volume alone misread a short squat wall (a 5mm low-ledge wall is ~5mm3,
+    # ~1mm tall) as a tine that "bites nothing, detached from wall" (torus X45).
+    # Anything small but taller than a tine is wall-like: it joins `walls` for
+    # the grip test instead, and must stay out of the part like any wall.
+    tines = [b for b in added if b.volume < TINE_MAX_VOL and b.extents[2] <= TINE_MAX_H]
+    walls += [b for b in added if b.volume <= WALL_MIN_VOL and b not in tines]
     problems = []
 
     # A PROP has no tines by design: it stops short of the part so the part
@@ -201,9 +208,15 @@ def check(case):
     # patch has most of its area further away, which drags a median upward and
     # reports a defect that is not there. Closest approach is what "spaced 0.2mm
     # away" actually means.
-    gaps = []
+    # A base flange (the plate foot of a wall) has no standoff spec -- it only
+    # has to clear the part like a flank. Told apart by HEIGHT, as check_props
+    # does: this used to be `len(b.vertices) > 40`, which skipped every long
+    # wall and measured a short wall's 0.6mm flange as a wall instead (bar
+    # X30Y60: "standoff 30.9" was a flange 31mm below the part, wall at 0.17).
+    gaps, flanks = [], []
     for b in walls:
-        if len(b.vertices) > 40:        # the base ellipse, not a wall
+        if b.bounds[1][2] - b.bounds[0][2] <= FLANGE_MAX_H:
+            flanks.append(float(np.abs(pq.signed_distance(b.vertices)).min()))
             continue
         pts, _ = trimesh.sample.sample_surface(b, 6000)
         d = pq.signed_distance(pts)
@@ -212,6 +225,8 @@ def check(case):
     gap_txt = ', '.join(f'{g:.3f}' for g in gaps) if gaps else 'n/a'
     if gaps and any(abs(g - STANDOFF) > 0.05 for g in gaps):
         problems.append(f'standoff off spec ({gap_txt})')
+    if flanks and min(flanks) < FLANK_MIN:
+        problems.append(f'flange {min(flanks):.3f} < {FLANK_MIN} (would weld)')
 
     ok = not problems
     cov, tot = coverage(case, added)

@@ -1,0 +1,81 @@
+// Bridge between a plugin's Python and the fin engine.
+//
+// Python plugins (Orca today) run this bundle, built by plugins/shared/bundle.py,
+// inside an embedded V8 (mini-racer). Plain V8 has no atob/btoa/TextDecoder, so
+// geometry crosses the boundary as base64 of raw little-endian bytes, decoded here
+// by hand. That is ~20x smaller and much faster than a JSON number array for a
+// 100k-triangle part.
+//
+//   in : base64 float64 triangle soup (posed, mm) + JSON options
+//   out: JSON { triangles: base64 float32 soup (seated frame), offset, pieces,
+//               overFaces, smallFaces, stats }
+// drawWallB64 does the same for Draw mode (draw_entry.js): one wall between two points.
+import { computeFins, ENGINE_DEFAULTS, optionsFromDialog, optionVisible, OPTIONS_SCHEMA } from './fins_entry.js';
+import { drawWall } from './draw_entry.js';
+
+const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+const LOOKUP = new Uint8Array(256);
+for (let i = 0; i < B64.length; i++) LOOKUP[B64.charCodeAt(i)] = i;
+
+export function b64ToBytes(s) {
+  let pad = 0;
+  if (s.endsWith('==')) pad = 2; else if (s.endsWith('=')) pad = 1;
+  const n = (s.length / 4) * 3 - pad;
+  const out = new Uint8Array(n);
+  let o = 0;
+  for (let i = 0; i < s.length; i += 4) {
+    const a = LOOKUP[s.charCodeAt(i)], b = LOOKUP[s.charCodeAt(i + 1)];
+    const c = LOOKUP[s.charCodeAt(i + 2)], d = LOOKUP[s.charCodeAt(i + 3)];
+    const v = (a << 18) | (b << 12) | (c << 6) | d;
+    if (o < n) out[o++] = (v >> 16) & 255;
+    if (o < n) out[o++] = (v >> 8) & 255;
+    if (o < n) out[o++] = v & 255;
+  }
+  return out;
+}
+
+export function bytesToB64(bytes) {
+  const parts = [];
+  let chunk = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const a = bytes[i], b = i + 1 < bytes.length ? bytes[i + 1] : 0, c = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    const v = (a << 16) | (b << 8) | c;
+    chunk += B64[(v >> 18) & 63] + B64[(v >> 12) & 63]
+      + (i + 1 < bytes.length ? B64[(v >> 6) & 63] : '=')
+      + (i + 2 < bytes.length ? B64[v & 63] : '=');
+    if (chunk.length > 65536) { parts.push(chunk); chunk = ''; }
+  }
+  parts.push(chunk);
+  return parts.join('');
+}
+
+const soupOf = (b64) => {
+  const bytes = b64ToBytes(b64);
+  return new Float64Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 8);
+};
+const trianglesB64 = (t) => bytesToB64(new Uint8Array(t.buffer, t.byteOffset, t.byteLength));
+
+export function computeFinsB64(soupB64, optionsJson) {
+  const options = optionsJson ? JSON.parse(optionsJson) : {};
+  const res = computeFins(soupOf(soupB64), options);
+  return JSON.stringify({ triangles: trianglesB64(res.triangles), offset: res.offset,
+                          pieces: res.pieces, overFaces: Array.from(res.overFaces),
+                          smallFaces: Array.from(res.smallFaces), stats: res.stats });
+}
+
+// a, b: JSON [x, y, z] in the soup's frame.
+export function drawWallB64(soupB64, aJson, bJson, optionsJson) {
+  const options = optionsJson ? JSON.parse(optionsJson) : {};
+  const res = drawWall(soupOf(soupB64), JSON.parse(aJson), JSON.parse(bJson), options);
+  if (!res.ok) return JSON.stringify(res);
+  return JSON.stringify({ ok: true, triangles: trianglesB64(res.triangles), offset: res.offset, stats: res.stats });
+}
+
+// A Python host's settings dialog, as JSON strings like computeFinsB64 (supportfins_host
+// host_schema / host_options / host_visible).
+export const optionsSchemaJson = () => JSON.stringify(OPTIONS_SCHEMA);
+export const optionsFromDialogJson = (valuesJson) => JSON.stringify(optionsFromDialog(JSON.parse(valuesJson)));
+export const optionVisibleJson = (key, valuesJson) => optionVisible(key, JSON.parse(valuesJson));
+
+// optionsFromDialog / optionVisible / OPTIONS_SCHEMA: what a host's settings dialog needs
+export { computeFins, drawWall, ENGINE_DEFAULTS, optionsFromDialog, optionVisible, OPTIONS_SCHEMA };

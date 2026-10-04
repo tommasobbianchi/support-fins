@@ -1,0 +1,12 @@
+{
+  // printfins.com is a fully static site — every file lives in web/ and runs in
+  // the browser (no server code). Cloudflare's git integration deploys this repo
+  // as a Workers "static assets" project (named support-fins in the dashboard),
+  // so it needs this config to know WHERE the site is. No "main" key = there is
+  // no Worker script, just files; web/_redirects still applies under Static Assets.
+  "name": "support-fins",
+  "compatibility_date": "2026-09-21",
+  "assets": {
+    "directory": "./web"
+  }
+}

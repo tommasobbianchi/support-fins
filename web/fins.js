@@ -1,14 +1,9 @@
 /**
- * Fin generation -- M4. The fin stands BESIDE the part on a flat upright face,
- * held off by a standoff, and horizontal tines fuse across that gap into the
- * part. See planes.js for why M3's sweep-under-the-overhang geometry had to be
- * abandoned, and docs/FIN-SPEC.md for where every number below comes from.
- *
- * A fin is three kinds of solid that overlap and get unioned by the slicer -- no
- * boolean kernel anywhere, the same approach the rest of the project uses:
- *   1. the WALL, a thin round-topped blade standing off the part face;
- *   2. the BASE, a wide flat ellipse that keeps the wall stuck to the plate;
- *   3. the TINES, tiny horizontal nubs bridging the standoff into the part.
+ * Combined support -- the entry point the app, the Worker and the plugins call.
+ * `buildFins` builds the tined breakaway walls (prop.js) under the overhangs,
+ * adds angled wedges under the broad downward faces no wall reached, lays a bed
+ * pad under a part that barely touches the plate, and runs sway braces last.
+ * docs/FIN-SPEC.md is where every number comes from.
  *
  * The tines are the point. A wall with only a gap constrains the part in one
  * direction and it falls away sideways -- Slant3D demos a cube doing exactly
@@ -21,89 +16,35 @@
  * a retraction each. Horizontal tines also lie in the plane of the layer lines,
  * which is what lets you BEND them to snap clean instead of tearing them out.
  *
- * Everything about the wall is built in the patch's frame (planes.js), so a fin
- * serving a leaning face leans with it. The tines are the exception: they are
- * built in world axes, because a tine must occupy ONE layer, and a box that is
- * flat in a leaning frame is not flat in z.
+ * LAYOUT. This file is the entry point: `buildFins`, `buildFinsCore` (auto and
+ * prop), `applyTunables`, `coverPitch`, and re-exports of everything app.js,
+ * orient.js, finworker.js, ui/, the plugins and the tests import. The pieces
+ * live in web/fins/:
+ *
+ *   config.js     FIN, the tine, pad and coverage numbers the UI shares
+ *   seating.js    how the part sits on the plate: contact, face/edge/point
+ *   pad.js        PAD and the bed pad (conforming oval, or the brim-style one)
+ *   wedges.js     angled wedges where no wall reaches; gripPatches for Draw
+ *   shortwalls.js the last resort: short, stocky walls where nothing else reached
+ *
+ * Each module imports only modules above it in this list and never fins.js.
  */
-import { findWallPatches, patchProbe, patchPoint, tAtZ, zAt } from './planes.js';
-import { BED_EPS } from './overhangs.js';
-import { insidePart } from './inside.js';
-import { buildProps, noProps, surfaceZAt, emitTines, tineStepFor } from './prop.js';
+import { floatingPieces } from './pieces.js';
+import { findWallPatches } from './planes.js';
+import { buildProps, noProps, PROP } from './prop.js';
+import { buildSwayBraces } from './sway.js';
+import { CUT, CUTOUT_PATTERNS } from './cutout.js';
+import { FIN } from './fins/config.js';
+import { buildPad, PAD } from './fins/pad.js';
+import { bedContact, seatedPartTris, seatingOf } from './fins/seating.js';
+import { lastResortWalls } from './fins/shortwalls.js';
+import { buildPerpFins, PERP, propServesPatch, unservedAfterWedges, wedgeVeto } from './fins/wedges.js';
 
-export const FIN = {
-  // --- from docs/FIN-SPEC.md, stated on camera. Do not "tune" these. ---
-  gap: 0.2,           // standoff from the part face
-  tineH: 0.2,         // = slicer layer height: a tine must be ONE layer so it prints
-                      // as a single continuous bead (see prop.js tineH / FIN-SPEC)
-  tineW: 0.5,         // between one nozzle pass (0.4) and out-and-back (0.8)
-  baseH: 1.0,         // base disc thickness
-  rowsLow: 8,         // tine rows in the dense zone -- "7 or 8 low down"
-
-  // --- ours, derived or measured ---
-  th: 1.2,            // wall thickness
-  tineBite: 0.3,      // how far a tine sinks into the part
-  tineGrip: 0.4,      // how far a tine reaches back into the wall
-  tineSpanMax: 1.5,   // mm of UNSUPPORTED tine; past this it is a bridge, not a
-                      // tine (measured in prototype/probe_tines2.py)
-  tineSpacingU: 14,   // mm between tines along the wall
-  rowGapMin: 0.8,     // mm; below this the rows stop being separate beads
-  denseZone: 6,       // mm of height that gets the dense tine rows
-  rowGrowth: 1.6,     // row spacing multiplier above the dense zone
-  baseMinor: 9.0,     // base ellipse depth, across the wall
-  basePad: 3.0,       // base ellipse overhang past the wall ends
-  arcSegs: 8,         // segments in the rounded top
-  ellipseSegs: 40,
-  minTines: 3,        // fewer than this and it is a prop, not a combined support
-  // Reject a site whose tined zone starts above this * height -- a bare stilt
-  // holds little and is most of the plastic. Kept modest (0.4): the "78mm part
-  // held by one 4mm nub" bug was NOT this filter, it was the score-ratio break
-  // below stopping the search after one fin. With that fixed, a tight stilt
-  // filter is free -- it just keeps a second fin off a mostly-airborne face.
-  stiltFrac: 0.4,
-  padH: 0.5,          // bed pad thickness
-  padMargin: 4.0,     // how far the pad's open-bed grip spreads past the part's
-                      // contact. A part tilted onto an EDGE grips only the OUTBOARD
-                      // side (inboard the part rises over the pad, which conforms
-                      // or drops), so the whole hold is one narrow strip. This was
-                      // 8mm to anchor a near-zero-contact tilted cube on the pad
-                      // alone, but that made the pad a fat blob on every part;
-                      // Matthew chose a slimmer, cleaner oval and a slicer brim for
-                      // the worst tilts instead (the readout says so). Outboard
-                      // cells sit on open bed at full height, so the margin only
-                      // adds bed grip -- it can never weld to the part.
-  padSegs: 48,        // segments on the smooth-oval pad (open-bed footprint)
-  padMinArea: 60.0,   // mm^2 of bed contact above which no pad is needed
-  maxLen: 25,         // mm; a fin is a short brace at a corner, not a full-length wall
-  // Grip-first holds the part, and the spec's own rule is "long parts: two fins,
-  // opposite sides" -- so one fin is too few and this is exactly two. Not more:
-  // over-finning is the baseline this tool argues against ("less plastic because
-  // it refuses to over-support"). Where two clear opposite faces don't exist the
-  // part gets one and the readout says to rotate; it never sprays a dozen.
-  maxFins: 2,
-  maxSiteTries: 24,   // candidate faces to attempt before giving up
-  // A later fin must still clear this fraction of the best fin's score, so junk
-  // sites are skipped -- but at 0.35 this fired right after the first fin and
-  // STOPPED the search before it ever reached the opposite-side face (which
-  // scores ~0.7x by construction below). 0.25 keeps the anti-junk floor while
-  // letting the opposite fin through.
-  minScoreRatio: 0.25,
-  minSeparationDeg: 60, // ...and face at least this far from those chosen
-  minSiteGap: 12,     // mm; ...and stand this far from them in space, see below
-  // WIDE-FACE ROW COVERAGE. maxFins:2 is the "opposite corners" rule for a
-  // COMPACT part's torsion; a face WIDER than this is not a corner to brace but
-  // an EDGE to line, and gets a whole ROW of braces tiled along it instead -- a
-  // 300mm plate edge sags with one 25mm corner brace. Density is the maker's
-  // call via opts.coverage (0 sparse .. 1 dense), which maps to the row pitch.
-  wideFace: 55,       // mm of grippable u-extent above which a face tiles a row
-  wideMinArea: 1500,  // ...AND this much face area, so a long THIN spike (a needle,
-                      // a plate's own 4mm edge) is not mistaken for a broad face
-  coverExtraSparse: 88, // mm row pitch at coverage 0 (below the neutral default)
-  coverSparse: 55,    // mm row pitch at coverage 0.5 -- the neutral default
-  coverDense: 22,     // mm row pitch at coverage 1
-  coverDefault: 0.5,  // density used when the UI has not set one yet (neutral)
-  rowMaxTotal: 20,    // hard cap on total fins, so a row can never spray
-};
+// Moved into web/fins/ (one module per concern); re-exported here so every
+// importer of fins.js is unchanged.
+export { FIN } from './fins/config.js';
+export { PAD } from './fins/pad.js';
+export { gripPatches, perpColumns } from './fins/wedges.js';
 
 /**
  * Wedge row pitch for a coverage setting, mirroring prop.js's coverRowSpan: 0.5 is
@@ -118,1117 +59,97 @@ function coverPitch(coverage) {
 }
 
 /**
- * Extrude a closed convex polygon into a prism.
+ * Apply the page's clearance settings to FIN / PROP / PAD.
  *
- * `poly` is [[a, b], ...] wound counter-clockwise in the (a, b) plane, and the
- * frame (a, b, t) must be RIGHT-handed -- a x b = t. Given that, the winding
- * below comes out consistently outward, which is what makes each solid closed
- * and a thing the slicer will union rather than argue with.
+ * WHY THIS IS A PARAMETER AND NOT JUST A MODULE EDIT. ui/settings.js sets these objects
+ * directly (applyMaterial for the PLA/PETG profiles, the Support gap and Pad grip
+ * fields) and that works for anything it builds itself. But the real build runs in
+ * finworker.js, a module Worker with its OWN instance of fins.js and prop.js: module
+ * state does not cross a Worker boundary, so everything the page set stayed on the
+ * page. PETG picked in Auto mode therefore printed PLA's clearances -- silently, since
+ * the numbers on screen were right and only the geometry disagreed.
  *
- * @param P  (a, b, t) -> [x, y, z] world point
+ * So the values travel WITH the build request (opts.tunables, structured-cloned like
+ * every other option) and are applied here, in whichever instance is doing the work.
+ * Unknown or non-finite entries are ignored, and calling this with nothing leaves the
+ * defaults alone -- an old caller that doesn't pass tunables behaves exactly as before.
  */
-function extrude(poly, tLo, tHi, P, out) {
-  const n = poly.length;
-  const lo = poly.map(([a, b]) => P(a, b, tLo));
-  const hi = poly.map(([a, b]) => P(a, b, tHi));
-
-  for (let i = 0; i < n; i++) {
-    const j = (i + 1) % n;
-    out.push(lo[i], lo[j], hi[j]);
-    out.push(lo[i], hi[j], hi[i]);
-  }
-  for (let i = 1; i < n - 1; i++) {
-    out.push(hi[0], hi[i], hi[i + 1]);   // +t cap
-    out.push(lo[0], lo[i + 1], lo[i]);   // -t cap
-  }
-}
-
-/**
- * Where along the patch to put a fin, and how tall to make it.
- *
- * A patch is flat but the PART is not, so a wall standing off the patch plane
- * can still drive straight through geometry beside it. The fix is not to trim
- * the wall's LENGTH against a globally-tall wall -- that was the previous
- * version and it found nothing.
- *
- * THE THING THAT WAS WRONG: the wall's height came from the patch's bounding
- * box, so every u got a wall as tall as the patch's highest point. On a tilted
- * part the patch is a DIAGONAL BAND in (u, z), so at most u values that wall
- * shot right past the patch into the part's neighbouring faces. Mapping it made
- * it obvious -- two diagonal lines of obstruction running along the patch's
- * edges, together sweeping 92 of 100 bins on the hub. The wall was being blocked
- * by geometry it only reached because it was too tall to begin with.
- *
- * So the height follows the patch LOCALLY. Per bin we know the patch's own top,
- * and the lowest obstruction crossing the wall's slab; a window is valid when
- * its wall -- no taller than the lowest patch top inside it -- clears every
- * obstruction inside it.
- *
- * The window is also capped at `maxLen`, which is docs/FIN-SPEC.md's "place it
- * on an edge or corner, never mid-face" expressed as arithmetic: a fin is a
- * short brace at a corner, not a wall down the whole side of the part.
- */
-function chooseSpan(p, topo, rot, offset, pitch = 0) {
-  const { pos, nFaces } = topo;
-  const BIN = 0.5;
-  const nBins = Math.max(1, Math.ceil((p.u1 - p.u0) / BIN));
-  const wMin = FIN.gap - 0.05;   // anything this far out is in the wall's way
-  const zOf = (t) => p.n.z * p.d + p.t.z * t;   // world z on the patch face
-
-  // Per bin: how high the patch itself reaches, how low it starts, the lowest
-  // obstruction crossing the wall's slab, and whether the base is obstructed.
-  const patchTopT = new Float64Array(nBins).fill(-Infinity);
-  const patchBotT = new Float64Array(nBins).fill(Infinity);
-  const obsMinZ = new Float64Array(nBins).fill(Infinity);
-  const baseBlocked = new Uint8Array(nBins);
-
-  // the patch's own profile: intersect each of its triangles with the vertical
-  // line at each bin centre, in the patch's (u, t) plane
-  const tris = p.tris;
-  for (let i = 0; i < tris.length; i += 9) {
-    const ux = [tris[i], tris[i + 3], tris[i + 6]];
-    const tv = [tris[i + 1], tris[i + 4], tris[i + 7]];
-    let lo = Math.min(ux[0], ux[1], ux[2]), hi = Math.max(ux[0], ux[1], ux[2]);
-    let b0 = Math.max(0, Math.ceil((lo - p.u0) / BIN - 0.5));
-    let b1 = Math.min(nBins - 1, Math.floor((hi - p.u0) / BIN - 0.5));
-    for (let b = b0; b <= b1; b++) {
-      const u = p.u0 + (b + 0.5) * BIN;
-      let tLo = Infinity, tHi = -Infinity;
-      for (let e = 0; e < 3; e++) {
-        const j = (e + 1) % 3;
-        const ua = ux[e], ub = ux[j];
-        if ((ua <= u) === (ub <= u)) continue;      // edge does not cross
-        const s = (u - ua) / (ub - ua);
-        const t = tv[e] + (tv[j] - tv[e]) * s;
-        if (t < tLo) tLo = t;
-        if (t > tHi) tHi = t;
-      }
-      if (tHi === -Infinity) continue;
-      if (tHi > patchTopT[b]) patchTopT[b] = tHi;
-      if (tLo < patchBotT[b]) patchBotT[b] = tLo;
-    }
-  }
-
-  // The wall and the base sweep different volumes, so each gets its own band.
-  // The base is only 1mm tall but reaches `baseMinor` outboard, which nothing
-  // used to check at all.
-  const bands = [
-    { wLo: wMin, wHi: FIN.gap + FIN.th + 0.15, base: false },
-    { wLo: wMin, wHi: FIN.gap + FIN.baseMinor + 0.3, base: true },
-  ];
-
-  // Blocking is per TRIANGLE, clipped to the volume the fin actually sweeps,
-  // then its u-extent is marked.
-  //
-  // The `w` bound is a BAND, not a half-space, and that distinction is the whole
-  // problem. Blocking on "any surface outboard of the wall's inner face" sounds
-  // safe and is badly wrong: on a hub, every other arm of the part sticks out
-  // past this patch's plane, so all 52 bins blocked with the obstruction sitting
-  // 14-58mm away -- open air where the wall wanted to stand. Bounding the band
-  // at the wall's outer face asks the right question, "does anything cross the
-  // volume the fin occupies".
-  //
-  // It is exact, not a heuristic, and the reason is worth keeping: if the wall's
-  // box were entirely buried inside solid material with no surface crossing it,
-  // the part would have to be solid down to the plate there -- and since nothing
-  // can extend below z = 0, it would then have a face at z ~ 0 inside the box,
-  // which this band catches. Engulfment without a crossing is not reachable.
-  //
-  // The two rejected alternatives, so they are not re-tried: testing VERTICES
-  // misses large faces (the hub is 1,186 triangles for the whole part, so single
-  // faces sail across the span with every vertex outside it), and blocking a
-  // face's FULL u-extent is far too blunt -- one big triangle grazing the wall
-  // blocks the entire patch.
-  const tri = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];   // [w, u, z] per vertex
-  for (let f = 0; f < nFaces; f++) {
-    for (let i = 0; i < 3; i++) {
-      const o = f * 9 + i * 3;
-      const x = pos[o], y = pos[o + 1], z = pos[o + 2];
-      const wx = rot[0] * x + rot[3] * y + rot[6] * z + offset.x;
-      const wy = rot[1] * x + rot[4] * y + rot[7] * z + offset.y;
-      const wz = rot[2] * x + rot[5] * y + rot[8] * z + offset.z;
-      tri[i][0] = wx * p.n.x + wy * p.n.y + wz * p.n.z - p.d;
-      tri[i][1] = wx * p.u.x + wy * p.u.y;
-      tri[i][2] = wz;
-    }
-    // cheap rejects shared by both bands
-    if (Math.max(tri[0][1], tri[1][1], tri[2][1]) < p.u0) continue;
-    if (Math.min(tri[0][1], tri[1][1], tri[2][1]) > p.u1) continue;
-    if (Math.min(tri[0][0], tri[1][0], tri[2][0]) > bands[1].wHi) continue;
-    if (Math.max(tri[0][0], tri[1][0], tri[2][0]) < wMin) continue;
-
-    for (const band of bands) {
-      if (Math.min(tri[0][0], tri[1][0], tri[2][0]) > band.wHi) continue;
-      const zHi = band.base ? FIN.baseH + 0.2 : Infinity;
-      if (Math.min(tri[0][2], tri[1][2], tri[2][2]) > zHi) continue;
-      if (Math.max(tri[0][2], tri[1][2], tri[2][2]) < -0.1) continue;
-
-      let poly = tri.map((v) => v.slice());
-      poly = clipHalfSpace(poly, (v) => v[0] - band.wLo);
-      poly = clipHalfSpace(poly, (v) => band.wHi - v[0]);
-      poly = clipHalfSpace(poly, (v) => v[2] + 0.1);
-      if (band.base) poly = clipHalfSpace(poly, (v) => zHi - v[2]);
-      if (poly.length < 2) continue;
-
-      let lo = Infinity, hi = -Infinity, zMin = Infinity;
-      for (const v of poly) {
-        if (v[1] < lo) lo = v[1];
-        if (v[1] > hi) hi = v[1];
-        if (v[2] < zMin) zMin = v[2];
-      }
-      if (hi < p.u0 || lo > p.u1) continue;
-      const b0 = Math.max(0, Math.floor((Math.max(lo, p.u0) - p.u0) / BIN));
-      const b1 = Math.min(nBins - 1, Math.floor((Math.min(hi, p.u1) - p.u0) / BIN));
-      for (let b = b0; b <= b1; b++) {
-        if (band.base) baseBlocked[b] = 1;
-        else if (zMin < obsMinZ[b]) obsMinZ[b] = zMin;
-      }
-    }
-  }
-
-  // Slide a window of up to maxLen and keep the best one. "Best" is wall AREA --
-  // height times length -- because a fin's job is bracing: a stubby tall fin and
-  // a long low one are both worse than the balanced one between them, and the
-  // scoring in chooseStabilize already handles WHICH face, not how much of it.
-  const maxBins = Math.max(1, Math.round(FIN.maxLen / BIN));
-  const minBins = Math.max(1, Math.ceil(MIN_SPAN / BIN));
-  const padBins = Math.ceil(FIN.basePad / BIN);
-  const cands = [];
-
-  for (let a = 0; a < nBins; a++) {
-    if (patchTopT[a] === -Infinity) continue;
-    let topT = Infinity, botT = -Infinity, lowObs = Infinity;
-    for (let b = a; b < Math.min(nBins, a + maxBins); b++) {
-      if (patchTopT[b] === -Infinity) break;     // patch has a hole here
-      topT = Math.min(topT, patchTopT[b]);
-      botT = Math.max(botT, patchBotT[b]);
-      lowObs = Math.min(lowObs, obsMinZ[b]);
-      if (b - a + 1 < minBins) continue;
-
-      // the base overhangs the wall's ends, so its own footprint must be clear
-      let baseOk = true;
-      for (let k = a - padBins; k <= b + padBins && baseOk; k++) {
-        if (k >= 0 && k < nBins && baseBlocked[k]) baseOk = false;
-      }
-      if (!baseOk) continue;
-
-      // The wall's highest point is not on the patch plane: it sits `w` outboard
-      // and carries a rounded cap, and on a leaning patch that lifts it further.
-      // Compare the real top against the obstruction, not the face's.
-      const wallTopZ = zOf(topT)
-        + Math.abs(p.n.z) * (FIN.gap + FIN.th) + FIN.th / 2;
-      if (wallTopZ >= lowObs) continue;          // wall would hit something
-      const grip = zOf(topT) - Math.max(zOf(botT), FIN.baseH);
-      if (grip < MIN_GRIP) continue;             // too little face to tine into
-
-      // Score by GRIP area, not wall area. A 57mm wall that only overlaps the
-      // patch for its top 4mm is mostly stilt: it looks impressive and holds
-      // almost nothing. What braces the part is the face the tines can reach.
-      const len = (b - a + 1) * BIN;
-      const score = grip * len;
-      cands.push({ score, a, b, topT, botT });
-    }
-  }
-
-  // Return several, not one. The winner still has to survive an exact
-  // containment check once its geometry exists (buildFin), and a site whose best
-  // window is buried usually has a perfectly good second one a few millimetres
-  // along. Returning only the maximum threw the whole face away.
-  const toSpan = (cnd) => ({
-    u0: p.u0 + cnd.a * BIN,
-    u1: p.u0 + (cnd.b + 1) * BIN,
-    tTop: cnd.topT,
-    tBot: cnd.botT,
-  });
-
-  // WIDE-FACE ROW: partition the patch into pitch-wide slots and return the best
-  // VALID window in each, so a long edge gets a fin tiled along its whole length.
-  // Every window still comes from `cands`, so it carries the same obstruction and
-  // grip guarantees as the score-picked path -- only the SELECTION differs.
-  if (pitch > 0) {
-    const uExt = p.u1 - p.u0;
-    const n = Math.max(1, Math.min(FIN.rowMaxTotal, Math.round(uExt / pitch)));
-    const slotW = uExt / n;
-    const bySlot = new Array(n).fill(null);
-    for (const c of cands) {
-      const cu = ((c.a + c.b + 1) / 2) * BIN;        // window centre, patch-local
-      const s = Math.max(0, Math.min(n - 1, Math.floor(cu / slotW)));
-      if (!bySlot[s] || c.score > bySlot[s].score) bySlot[s] = c;
-    }
-    return bySlot.filter(Boolean).map(toSpan);
-  }
-
-  cands.sort((x, y) => y.score - x.score);
-  const picked = [];
-  for (const cnd of cands) {
-    // keep them genuinely distinct rather than 40 slivers of the same window
-    if (picked.some((q) => Math.abs(q.a - cnd.a) < minBins
-                        && Math.abs(q.b - cnd.b) < minBins)) continue;
-    picked.push(cnd);
-    if (picked.length >= MAX_SPAN_TRIES) break;
-  }
-  return picked.map(toSpan);
-}
-
-const MIN_SPAN = 4.0;   // mm; a shorter wall is not worth the plate space
-const MAX_SPAN_TRIES = 8;  // candidate windows per site before giving up
-const MIN_GRIP = 3.0;   // mm of patch face the wall must overlap to be worth tining
-
-/** Sutherland-Hodgman: keep the part of `poly` where `f(v) >= 0`. */
-function clipHalfSpace(poly, f) {
-  const out = [];
-  for (let i = 0; i < poly.length; i++) {
-    const a = poly[i], b = poly[(i + 1) % poly.length];
-    const fa = f(a), fb = f(b);
-    if (fa >= 0) out.push(a);
-    if ((fa >= 0) !== (fb >= 0)) {
-      const t = fa / (fa - fb);
-      out.push([a[0] + (b[0] - a[0]) * t,
-                a[1] + (b[1] - a[1]) * t,
-                a[2] + (b[2] - a[2]) * t]);
-    }
-  }
-  return out;
-}
-
-/**
- * Does anything cross the volume this fin will occupy?
- *
- * chooseSpan already asks this, but against the PATCH's plane -- and buildFin
- * then re-seats the plane inward onto the window's own high point, which moves
- * the wall into space the search never examined. Two fins came out 0.005mm from
- * a neighbouring feature: outside the part, so containment passed, and close
- * enough to weld solid on the first layer. This re-checks the volume the fin
- * actually occupies, so it has to run on the final geometry rather than earlier.
- */
-function wallIsClear(p, u0, u1, zTop, topo, rot, offset) {
-  const { pos, nFaces } = topo;
-  const bands = [
-    { wLo: FIN.gap - 0.05, wHi: FIN.gap + FIN.th + 0.15, zHi: zTop },
-    { wLo: FIN.gap - 0.05, wHi: FIN.gap + FIN.baseMinor + 0.3, zHi: FIN.baseH + 0.2 },
-  ];
-  const uLo = u0 - FIN.basePad, uHi = u1 + FIN.basePad;
-  const tri = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-
-  for (let f = 0; f < nFaces; f++) {
-    for (let i = 0; i < 3; i++) {
-      const o = f * 9 + i * 3;
-      const x = pos[o], y = pos[o + 1], z = pos[o + 2];
-      const wx = rot[0] * x + rot[3] * y + rot[6] * z + offset.x;
-      const wy = rot[1] * x + rot[4] * y + rot[7] * z + offset.y;
-      const wz = rot[2] * x + rot[5] * y + rot[8] * z + offset.z;
-      tri[i][0] = wx * p.n.x + wy * p.n.y + wz * p.n.z - p.d;
-      tri[i][1] = wx * p.u.x + wy * p.u.y;
-      tri[i][2] = wz;
-    }
-    if (Math.max(tri[0][1], tri[1][1], tri[2][1]) < uLo) continue;
-    if (Math.min(tri[0][1], tri[1][1], tri[2][1]) > uHi) continue;
-    if (Math.max(tri[0][0], tri[1][0], tri[2][0]) < bands[0].wLo) continue;
-    if (Math.min(tri[0][0], tri[1][0], tri[2][0]) > bands[1].wHi) continue;
-
-    for (const band of bands) {
-      const uA = band.zHi > FIN.baseH + 0.3 ? u0 : uLo;   // base overhangs the ends
-      const uB = band.zHi > FIN.baseH + 0.3 ? u1 : uHi;
-      let poly = tri.map((v) => v.slice());
-      poly = clipHalfSpace(poly, (v) => v[0] - band.wLo);
-      poly = clipHalfSpace(poly, (v) => band.wHi - v[0]);
-      poly = clipHalfSpace(poly, (v) => v[2] + 0.1);
-      poly = clipHalfSpace(poly, (v) => band.zHi - v[2]);
-      poly = clipHalfSpace(poly, (v) => v[1] - uA);
-      poly = clipHalfSpace(poly, (v) => uB - v[1]);
-      if (poly.length >= 3) return false;
-    }
-  }
-  return true;
-}
-
-/**
- * Build one fin -- wall, base, tines -- for `patch`, or null if the site cannot
- * carry enough tines to be a combined support.
- *
- * @param opts.tines  false to build the wall + base WITHOUT the tine comb (the
- *                    plain breakaway variant the UI toggles to). Default true.
- */
-function buildFin(p0, out, span, topo, rot, offset, opts = {}) {
-  const before = out.length;
-  const withTines = opts.tines !== false;
-  // A fin serving a DOWNWARD overhang face sits tucked under the part at the
-  // plate-contact edge, where the part's own foot comes down right beside the
-  // wall. The base ellipse, centred tangent to the wall, then reaches back UNDER
-  // that tilted foot and reads as inside the part. Push it fully outboard (in +nh,
-  // which always points away from the part) so the whole disc clears -- the wall's
-  // outer half still overlaps it enough to anchor. Upright side fins are untouched.
-  const baseOut = p0.n.z < -0.05 ? 1.0 : 0;
-  const { u0, u1 } = span;
-  const r = FIN.th / 2;
-  const wIn = FIN.gap, wOut = FIN.gap + FIN.th;
-
-  // Re-seat the plane on the outermost point INSIDE THIS WINDOW. The patch's own
-  // supporting plane touches its global high point, which is usually somewhere
-  // else on a long curved face, leaving the wall hanging 0.4mm back from the bit
-  // it is actually gripping. Shifting it in makes the standoff mean 0.2mm here
-  // rather than 0.2mm somewhere on the same face.
-  //
-  // The shift is never outward: every sample is <= 0 behind the patch plane, so
-  // the wall still clears the whole window by at least the standoff.
-  // Computed EXACTLY, not sampled. `dev` is linear across each triangle, so its
-  // maximum over the window is attained at a vertex of the triangle clipped to
-  // the window -- clip and take the max. A 13x11 sample grid was tried first and
-  // it missed peaks between samples, seating walls 0.007mm off the part, which
-  // is worse than hanging back: that fuses.
-  const tLo = span.tBot ?? p0.t0, tHi = span.tTop ?? p0.t1;
-  let shift = -Infinity;
-  for (let i = 0; i < p0.tris.length; i += 9) {
-    let poly = [
-      [p0.tris[i], p0.tris[i + 1], p0.tris[i + 2]],
-      [p0.tris[i + 3], p0.tris[i + 4], p0.tris[i + 5]],
-      [p0.tris[i + 6], p0.tris[i + 7], p0.tris[i + 8]],
-    ];
-    poly = clipHalfSpace(poly, (v) => v[0] - u0);
-    poly = clipHalfSpace(poly, (v) => u1 - v[0]);
-    poly = clipHalfSpace(poly, (v) => v[1] - tLo);
-    poly = clipHalfSpace(poly, (v) => tHi - v[1]);
-    for (const v of poly) if (v[2] > shift) shift = v[2];
-  }
-  if (shift === -Infinity) shift = 0;
-  const p = { ...p0, d: p0.d + shift };
-
-  // --- wall: section in (t, w), extruded along u. (t, n, u) is right-handed. ---
-  // The bottom edge is the z = 0 line. In this frame that line is straight but
-  // SLANTED, because the two faces of a leaning wall meet the plate at different
-  // heights up the face -- which is exactly why the section is built here rather
-  // than as an axis-aligned rectangle.
-  const tBedIn = tAtZ(p, wIn, 0), tBedOut = tAtZ(p, wOut, 0);
-  const tTop = span.tTop ?? p.t1;
-  if (tTop - r <= Math.max(tBedIn, tBedOut) + 0.5) return null;  // no wall to build
-
-  const sec = [[tBedIn, wIn], [tTop - r, wIn]];
-  for (let i = 1; i < FIN.arcSegs; i++) {
-    const a = -Math.PI / 2 + (Math.PI * i) / FIN.arcSegs;
-    sec.push([tTop - r + r * Math.cos(a), FIN.gap + r + r * Math.sin(a)]);
-  }
-  sec.push([tTop - r, wOut], [tBedOut, wOut]);
-
-  // Verify the fin is actually in open air before committing to it. The span
-  // search is a proximity test over bins; this is the exact question. A fin that
-  // fails here is not a fin to shorten -- it is a site to abandon.
-  //
-  // Sampled on a grid, not at a few corners: a coarser version of this check
-  // passed a wall that had three vertices buried in a hub. The base gets its own
-  // samples because it reaches `baseMinor` outboard and `basePad` past the ends,
-  // so it can be inside the part while every point on the wall is clear.
-  const NU = 7, NT = 6;
-  for (let i = 0; i < NU; i++) {
-    const uu = u0 + ((u1 - u0) * i) / (NU - 1);
-    for (let j = 0; j < NT; j++) {
-      const tt = tBedIn + ((tTop - tBedIn) * j) / (NT - 1);
-      for (const ww of [wIn, wOut]) {
-        const q = patchPoint(p, ww, uu, tt);
-        if (insidePart(topo, rot, offset, q[0], q[1], q[2])) return null;
-      }
-    }
-  }
-  {
-    // the base's outer rim, at the height it actually occupies
-    const nhx0 = p.n.x / p.h, nhy0 = p.n.y / p.h;
-    const bw0 = FIN.baseMinor / 2, bu0 = (u1 - u0) / 2 + FIN.basePad;
-    const foot0 = patchPoint(p, wIn, (u0 + u1) / 2, tAtZ(p, wIn, 0));
-    const cx0 = foot0[0] + nhx0 * (bw0 + baseOut), cy0 = foot0[1] + nhy0 * (bw0 + baseOut);
-    // sampled through the base's full thickness, not just its mid-height: parts
-    // commonly flare in the first millimetre off the plate, so the rim can be
-    // clear at 0.5mm and buried at 1.0mm
-    for (let i = 0; i < 24; i++) {
-      const a = (2 * Math.PI * i) / 24;
-      const sx = bw0 * Math.cos(a), su = bu0 * Math.sin(a);
-      const qx = cx0 + nhx0 * sx + p.u.x * su;
-      const qy = cy0 + nhy0 * sx + p.u.y * su;
-      for (const qz of [0.05, FIN.baseH / 2, FIN.baseH]) {
-        if (insidePart(topo, rot, offset, qx, qy, qz)) return null;
-      }
-    }
-  }
-
-  if (!wallIsClear(p, u0, u1, zAt(p, FIN.gap + FIN.th, tTop) + r,
-                   topo, rot, offset)) return null;
-
-  extrude(sec, u0, u1, (a, b, t) => patchPoint(p, b, t, a), out);
-
-  // --- base: an ellipse on the plate, in world XY, extruded in z ---
-  // Its inner edge is tangent to the wall's inner face rather than centred under
-  // the wall, so the base never reaches the part. A base touching the part would
-  // weld the fin to it at the plate and stop it breaking away -- the one thing a
-  // breakaway fin must not do.
-  const nhx = p.n.x / p.h, nhy = p.n.y / p.h;
-  const foot = patchPoint(p, wIn, (u0 + u1) / 2, tBedIn);
-  const bw = FIN.baseMinor / 2;
-  const bu = (u1 - u0) / 2 + FIN.basePad;
-  const cx = foot[0] + nhx * (bw + baseOut), cy = foot[1] + nhy * (bw + baseOut);
-
-  const ell = [];
-  for (let i = 0; i < FIN.ellipseSegs; i++) {
-    const a = (2 * Math.PI * i) / FIN.ellipseSegs;   // (nh, u) is CCW in world XY
-    const s = bw * Math.cos(a), t = bu * Math.sin(a);
-    ell.push([cx + nhx * s + p.u.x * t, cy + nhy * s + p.u.y * t]);
-  }
-  extrude(ell, 0, FIN.baseH, (a, b, t) => [a, b, t], out);
-
-  // --- tines, in world axes so each one lands in a single layer ---
-  // Tine rows follow THIS window, not the patch's global z-range. Using the
-  // global range put most stations outside the local face, where patchCovers
-  // rejected them -- a 46mm wall came out with six tines.
-  const zTop = zAt(p, FIN.gap + r, tTop);
-  const localBot = span.tBot != null ? zAt(p, 0, span.tBot) : p.z0;
-  const zLo = Math.max(localBot, FIN.baseH) + 0.4;
-  const zHi = Math.min(zAt(p, 0, tTop), zTop) - FIN.tineH - 0.5;
-
-  // Dense low, spreading with height: the part is least stable early, when it is
-  // a narrow foot with all its leverage still to come. Higher up it is already
-  // braced by everything below.
-  const rows = [];
-  if (zHi > zLo) {
-    const dense = Math.min(zHi - zLo, FIN.denseZone);
-    let step = Math.max(FIN.rowGapMin, dense / FIN.rowsLow);
-    for (let z = zLo; z <= zHi; z += step) {
-      rows.push(z);
-      if (z > zLo + dense) step *= FIN.rowGrowth;
-    }
-  }
-
-  const inset = Math.min(FIN.tineW, (u1 - u0) / 4);
-  const sA = u0 + inset, sB = u1 - inset;
-  const nU = sB > sA ? Math.max(2, Math.ceil((sB - sA) / FIN.tineSpacingU) + 1) : 1;
-
-  let tines = 0;
-  if (withTines) for (const z of rows) {
-    const zMid = z + FIN.tineH / 2;
-    // the wall's outer anchor is fixed; the inner end moves to meet the surface
-    const s1 = (p.d + FIN.gap + FIN.tineGrip - p.n.z * zMid) / p.h;
-    for (let i = 0; i < nU; i++) {
-      const uv = nU === 1 ? (sA + sB) / 2 : sA + ((sB - sA) * i) / (nU - 1);
-
-      // Each tine measures its own gap. The wall is one flat plane but the
-      // surface it grips is not -- on a round part the face recedes as you move
-      // along the wall, and a fixed-length tine would hang in air a few
-      // millimetres from the middle. This is what lets one flat wall span many
-      // facets of a cone instead of gripping exactly one.
-      //
-      // Also does the coverage test: a patch's bounding box is not its shape,
-      // and a tine in the notch of an L-shaped face would print into thin air.
-      // Probe, then re-probe where the surface actually is. The first guess
-      // uses the t at which the PLANE crosses this height, but the surface sits
-      // `dev` behind the plane, and on a leaning patch that displaces t by up to
-      // a millimetre -- enough to read the offset off the wrong part of a curved
-      // face and leave the tine hanging.
-      let raw = patchProbe(p0, uv, tAtZ(p0, 0, zMid));
-      if (raw === null) continue;
-      const refined = patchProbe(p0, uv, tAtZ(p0, raw, zMid));
-      if (refined !== null) raw = refined;
-      const dev = raw - shift;          // relative to this fin's own plane
-      // past this the tine stops being a bead and becomes a bridge
-      if (FIN.gap - dev > FIN.tineSpanMax) continue;
-
-      const sPart = (p.d + dev - p.n.z * zMid) / p.h;
-      const s0 = sPart - FIN.tineBite / p.h;
-
-      // Confirm the bite rather than trusting the probe. The offset is
-      // interpolated across a triangle, so near an edge it can be off by enough
-      // for the tine to stop short -- and a tine that fuses nothing is a loose
-      // speck rattling around the plate. Cheap: one parity query against the
-      // grid inside.js already built.
-      if (!insidePart(topo, rot, offset,
-                      nhx * s0 + p.u.x * uv, nhy * s0 + p.u.y * uv, zMid)) continue;
-      const rect = [[z, s0], [z + FIN.tineH, s0], [z + FIN.tineH, s1], [z, s1]];
-      // (z, nh, u) is right-handed: z x nh = u.
-      extrude(rect, uv - FIN.tineW / 2, uv + FIN.tineW / 2,
-              (a, b, t) => [nhx * b + p.u.x * t, nhy * b + p.u.y * t, a], out);
-      tines++;
-    }
-  }
-
-  // A wall with too little grip is the M3 failure mode with extra steps: it
-  // props the part in one direction and lets it fall away in the other. Only the
-  // TINED variant makes that promise; the plain (tines-off) wall is a breakaway
-  // wall and is allowed to grip nothing.
-  if (withTines && tines < FIN.minTines) { out.length = before; return null; }
-
-  return {
-    // the site, so a failure can be traced back to the face that produced it
-    site: { d: p.d, n: { ...p.n }, u0, u1, tTop, lean: p.lean,
-            patchU: [p.u0, p.u1], patchT: [p.t0, p.t1] },
-    tines, rows: rows.length,
-    height: zTop, length: u1 - u0,
-    stilt: Math.max(0, p.z0 - FIN.baseH),
-    lean: p.lean,
-    bearing: Math.round((Math.atan2(p.n.y, p.n.x) * 180) / Math.PI),
-  };
-}
-
-export const PAD = {
-  cell: 1.2,        // mm; radial vertex spacing across the conforming oval disc
-  grab: 0.05,       // mm the pad rises PAST the part underside to bite in near the
-                    // contact, instead of standing off. A tilted part rests on a
-                    // knife edge; a pad held 0.2mm below it never touches (the "huge
-                    // gap"), so the part peeled while its own edge did all the
-                    // anchoring. The pad is a baked brim -- it has to CONNECT. But a
-                    // 0.15mm bite read as "too close"/welded, so this is a light TACK:
-                    // just enough to connect the part to the wide open-bed grip
-                    // (padMargin), which does the actual holding, while staying thin
-                    // enough to snap off clean. Capped at padH so the tack only lands
-                    // on the low near-edge strip; bounded by grab it can never
-                    // recreate the deep 0.46mm slab weld the old flat pad made.
-                    //
-                    // May be NEGATIVE: PETG welds to a support far harder than the
-                    // PLA this 0.05 tack was tuned for, so the PETG profile sets a
-                    // gap (-0.1) -- the pad stands a hair BELOW the part and snaps
-                    // off clean. `conform` floors every column at 0.05 so a gap pad
-                    // stays a valid watertight solid AND still kisses the part at
-                    // the resting edge (where the underside drops to the plate) to
-                    // hold it, while gapping off across the rest of the footprint.
-};
-
-/**
- * A breakaway pad under the part's bed contact.
- *
- * Not a nicety: a part tilted into a strong orientation rests on an EDGE, so its
- * bed contact is near zero and it peels off before the fins have anything to
- * hold. The pad is a wide, thin footprint -- thin enough to cut off, wide enough
- * to stick.
- *
- * It is fed the part's lowest VERTICES for its outline (a part standing on an
- * edge has no face on the plate at all, so a face-based footprint is empty in
- * precisely the case the pad exists for) AND the seated part triangles, so its
- * TOP can hold `gap` clear of the part instead of welding to it.
- *
- * THE SHAPE: the first pad was a flat 0.5mm slab, so wherever the part's underside
- * dipped into that band -- which is exactly the resting contact the pad exists for
- * -- the two fused solid (measured 0.46mm of interpenetration on a tilted
- * drive_frame) and would not break off. The pad conforms to the part instead, and
- * (Matthew's ask) it is a clean OVAL rather than a boxy grid: a radial mesh of the
- * contact ellipse -- rings of vertices from the centre out to (r1, r2) -- with each
- * vertex given its own top height. OUTBOARD (no part overhead) rises to the full
- * `padH` for the wide bed grip; under the part it caps at `part_low + grab`, a light
- * tack that connects without the deep weld. The disc is one watertight solid (top
- * cap + flat bottom + side wall), so there are no cells to drop and no holes.
- */
-/**
- * The whole part, seated into print space, as a flat triangle array -- what
- * `surfaceZAt` needs to know how low the part hangs over each pad cell. Built
- * only when a pad is actually wanted (small bed contact), so the full-mesh pass
- * is not paid on every well-seated part.
- */
-function seatedPartTris(topo, rot, offset) {
-  const { pos, nFaces } = topo;
-  const { x: ox, y: oy, z: oz } = offset;
-  const tris = new Float64Array(nFaces * 9);
-  for (let f = 0; f < nFaces; f++) {
-    for (let i = 0; i < 3; i++) {
-      const o = f * 9 + i * 3;
-      const x = pos[o], y = pos[o + 1], z = pos[o + 2];
-      tris[o] = rot[0] * x + rot[3] * y + rot[6] * z + ox;
-      tris[o + 1] = rot[1] * x + rot[4] * y + rot[7] * z + oy;
-      tris[o + 2] = rot[2] * x + rot[5] * y + rot[8] * z + oz;
-    }
-  }
-  return tris;
-}
-
-function buildPad(contact, partTris, out) {
-  if (contact.length < 3) return null;
-
-  let cx = 0, cy = 0;
-  for (const p of contact) { cx += p[0]; cy += p[1]; }
-  cx /= contact.length; cy /= contact.length;
-
-  // principal axis of the contact, so a long thin edge gets a long thin pad
-  // instead of a circle sized to its length
-  let sxx = 0, sxy = 0, syy = 0;
-  for (const p of contact) {
-    const dx = p[0] - cx, dy = p[1] - cy;
-    sxx += dx * dx; sxy += dx * dy; syy += dy * dy;
-  }
-  const tr = sxx + syy, det = sxx * syy - sxy * sxy;
-  const lam = tr / 2 + Math.sqrt(Math.max(0, (tr * tr) / 4 - det));
-  let ax = sxy, ay = lam - sxx;
-  if (Math.hypot(ax, ay) < 1e-9) { ax = 1; ay = 0; }
-  const an = Math.hypot(ax, ay); ax /= an; ay /= an;
-  const bx = -ay, by = ax;
-
-  let e1 = 0, e2 = 0;
-  for (const p of contact) {
-    const dx = p[0] - cx, dy = p[1] - cy;
-    e1 = Math.max(e1, Math.abs(dx * ax + dy * ay));
-    e2 = Math.max(e2, Math.abs(dx * bx + dy * by));
-  }
-  const r1 = e1 + FIN.padMargin, r2 = e2 + FIN.padMargin;
-
-  // A CONFORMING ELLIPTICAL DISC, not a boxy grid. Matthew wanted the pad to read
-  // as a clean oval, but it still has to duck under a tilted part's flank the way
-  // the old heightfield did. So build a radial mesh of the ellipse -- rings of
-  // vertices from the centre out to (r1, r2) -- and give each vertex its own
-  // conformed top height, exactly as a grid cell used to. The result is a smooth
-  // oval outline whose TOP follows the part surface. It replaces both the boxy
-  // grid AND the flat-ellipse fast path (which only fired on open-bed footprints,
-  // so a tilted cube -- the case Matthew was looking at -- never became an oval).
-  //
-  // Height rule per vertex, unchanged from the grid: OUTBOARD (no part overhead)
-  // rises to the full padH for bed grip; UNDER the part it caps at part_low + grab
-  // to bite in a hair rather than stand off or weld deep. low+grab is always >= grab
-  // (0.05mm) > 0, so every column has positive height and the mesh stays a valid,
-  // watertight solid -- no cells to drop, no holes in the disc.
-  const conform = (x, y) => {
-    const low = surfaceZAt(partTris, x, y);
-    if (low === null) return FIN.padH;
-    // grab may be negative (a PETG gap). Floor at 0.05 so every column stays
-    // positive -- the disc watertight, no dropped cells -- and so a gap pad still
-    // kisses the part where its underside drops to the plate (the resting edge) to
-    // hold it, while gapping off across the rest of the footprint.
-    return Math.max(0.05, Math.min(FIN.padH, low + PAD.grab));
-  };
-  const nTheta = FIN.padSegs;
-  const nRing = Math.max(2, Math.ceil(Math.max(r1, r2) / PAD.cell));
-
-  // Ring/segment vertex in world XY, at radial fraction `fr` and angle index `j`.
-  const vAt = (fr, j) => {
-    const a = (2 * Math.PI * j) / nTheta;
-    const s = r1 * fr * Math.cos(a), t = r2 * fr * Math.sin(a);
-    return [cx + ax * s + bx * t, cy + ay * s + by * t];
-  };
-  // Precompute the vertex ring positions + their conformed tops once (reused by the
-  // top cap, the side wall, and the flat bottom), so every shared edge is keyed
-  // from bit-identical coordinates and the soup stays edge-manifold.
-  const V = [];   // V[i][j] = [x, y, topZ], i in 0..nRing, j in 0..nTheta-1
-  for (let i = 0; i <= nRing; i++) {
-    const fr = i / nRing, row = [];
-    for (let j = 0; j < nTheta; j++) {
-      const [x, y] = vAt(fr, j);
-      row.push([x, y, conform(x, y)]);
-    }
-    V.push(row);
-  }
-  const centreTop = V[0][0];   // ring 0 collapses to the centre (fr = 0)
-  const tri = (a, b, c) => out.push(a, b, c);
-  let maxTop = 0;
-  for (const row of V) for (const v of row) if (v[2] > maxTop) maxTop = v[2];
-
-  for (let j = 0; j < nTheta; j++) {
-    const jn = (j + 1) % nTheta;
-    // TOP surface (normal up). Inner fan from the centre, then quad strips outward.
-    tri(centreTop, V[1][j], V[1][jn]);
-    for (let i = 1; i < nRing; i++) {
-      tri(V[i][j], V[i + 1][j], V[i + 1][jn]);
-      tri(V[i][j], V[i + 1][jn], V[i][jn]);
-    }
-    // BOTTOM surface at z=0 (normal down: reverse the top winding).
-    const b0 = [cx, cy, 0];
-    const bi = (i, k) => [V[i][k][0], V[i][k][1], 0];
-    tri(b0, bi(1, jn), bi(1, j));
-    for (let i = 1; i < nRing; i++) {
-      tri(bi(i, j), bi(i + 1, jn), bi(i + 1, j));
-      tri(bi(i, j), bi(i, jn), bi(i + 1, jn));
-    }
-    // SIDE wall around the outer ring, top down to the plate (normal outward).
-    const oR = nRing;
-    const tj = V[oR][j], tjn = V[oR][jn];
-    const bj = [tj[0], tj[1], 0], bjn = [tjn[0], tjn[1], 0];
-    tri(tj, bj, bjn);
-    tri(tj, bjn, tjn);
-  }
-
-  return { r1, r2, cells: nTheta * nRing, height: maxTop, points: contact.length, oval: true };
-}
-
-/**
- * DRAW mode support: every grippable face in this pose, and a map from any face
- * index to the patch it belongs to. Grip-first Draw lets the user pick the face
- * by hand, so the UI needs to know which faces CAN take a fin (to guide the
- * pointer) and, given a picked face, which patch to stand a fin against. This is
- * findWallPatches plus a face->patch index; the caller caches it per orientation
- * and rebuilds only when the part turns.
- *
- * Only DOWNWARD faces are offered: a support fin is a perpendicular wedge that
- * holds an overhang up from below, so highlighting a vertical side (which the
- * old beside-the-face fin gripped) would just guide the pointer at a face the
- * build then refuses.
- */
-export function gripPatches(topo, result, rot) {
-  const patches = findWallPatches(topo, rot, result.offset).filter((p) => p.n.z < -0.05);
-  const faceMap = new Map();
-  for (const p of patches) for (const f of p.faces) if (!faceMap.has(f)) faceMap.set(f, p);
-  return { patches, faceMap };
-}
-
-/**
- * Build the PERPENDICULAR wedge support against a face the user picked in Draw
- * mode -- the same edge-on rib auto places, honouring the pick (no broad-face
- * gate, so even a smaller overhang the user clicks gets at least one wedge).
- * Returns { ok, triangles, info } or { ok:false, reason } with a message the UI
- * can show; a hand-placed fin that can't build must say WHY, never fail silently
- * (the M5 scoreboard trap).
- *
- * A support fin holds an overhang up from below, so it only makes sense on a
- * DOWNWARD face -- clicking a vertical side is refused with that reason, rather
- * than standing the old flat-against-the-face blade there.
- */
-export function buildFinOnPatch(topo, result, rot, patch, opts = {}) {
-  if (patch.n.z >= -0.05) {
-    return { ok: false, reason: 'aim at a downward / overhang face — a support fin '
-      + 'holds an overhang up from below, not a vertical side' };
-  }
-  const w = buildPerpFins(patch, topo, rot, result.offset, { tines: opts.tines, tineDensity: opts.tineDensity });
-  if (!w.count) {
-    return { ok: false, reason: 'this face is too small or shallow to stand a fin '
-      + 'under — tilt it steeper, or pick a broader overhang' };
-  }
-  return { ok: true, triangles: w.triangles, info: { count: w.count, tines: w.tines, perp: true } };
-}
-
-/**
- * STABILIZE mode: pick the few sites that best keep the part standing.
- *
- * This is not "a fin per overhang" -- that is Coverage mode, and on a tilted
- * Voron frame it wants 13 walls 12-103mm tall. Stabilize asks the question the
- * technique was invented for: the part has been turned onto an edge to print
- * strong, so what stops it toppling? The answer is one or two tall fins on the
- * side it wants to fall toward, plus one opposite so it cannot twist off.
- *
- * `tip` is the horizontal direction the part leans: from the centre of its bed
- * contact toward the centre of its mass. A fin whose face looks along that
- * direction is a fin in the way of the fall.
- */
-function rankSites(patches, tip, stats = null) {
-  // COMBINED SUPPORT places its fins on the part's DOWNWARD overhang faces (the
-  // surfaces that actually need holding up), following each face down to the
-  // plate -- not on the upright side faces the old beside-the-face model picked,
-  // which stood a lonely fin against a wall that was printing fine on its own.
-  // Also drop bare-stilt sites: a face starting high off the plate makes the wall
-  // below it a stilt that holds nothing and is most of the plastic.
-  const usable = patches.filter((p) =>
-    p.n.z < -0.05 && p.z0 - FIN.baseH <= FIN.stiltFrac * p.z1);
-  if (stats) stats.tooHigh = patches.length - usable.length;
-  if (!usable.length) return [];
-
-  const maxH = Math.max(...usable.map((p) => p.z1), 1);
-  const maxW = Math.max(...usable.map((p) => p.u1 - p.u0), 1);
-
-  // A stilt is penalised as well as capped. The hard filter alone let fins land
-  // 10-14mm up the part -- legal, but they read as stuck on halfway up rather
-  // than bracing anything, and the bare wall under them is the wobbliest part of
-  // the fin. Between two otherwise equal faces, the lower one is the better
-  // brace, so height alone must not decide it.
-  // Both sides matter, not just the one the part falls toward. The spec puts a
-  // fin on the fall side AND one opposite so the part cannot twist off, so a face
-  // looking AWAY from the lean must still rank -- `Math.max(0, align)` zeroed it
-  // and the opposite fin never got built. `alignAbs` keeps both sides in play;
-  // the small `alignPos` bonus still lets the fall-toward face win the top slot.
-  return usable.map((p) => {
-    const a = tip ? (p.n.x * tip.x + p.n.y * tip.y) / p.h : 0;
-    const alignAbs = Math.abs(a), alignPos = Math.max(0, a);
-    const stilt = Math.max(0, p.z0 - FIN.baseH) / maxH;
-    return {
-      patch: p,
-      score: 0.7 * alignAbs + 0.3 * alignPos
-           + 0.6 * (p.z1 / maxH)
-           + 0.4 * ((p.u1 - p.u0) / maxW)
-           - 1.2 * stilt,
-    };
-  }).sort((a, b) => b.score - a.score);
-}
-
-/**
- * Is this site too close to one that already carries a fin?
- *
- * Checked in POSITION as well as direction. Comparing only normals looks
- * sufficient and is not: the two faces of a thin rib are a perfect 180 degrees
- * apart and sail through, which is how one hub got two "opposite" fins standing
- * 1.6mm from each other. Two fins that close are one fin's worth of bracing at
- * two fins' cost -- and the reason the spec says opposite sides is torsion,
- * which needs a lever arm.
- */
-function clashes(taken, cand) {
-  const sepCut = Math.cos((FIN.minSeparationDeg * Math.PI) / 180);
-  return taken.some((a) => {
-    const aligned = (a.n.x * cand.n.x + a.n.y * cand.n.y) / (a.h * cand.h) > sepCut;
-    const dx = a.mid.x - cand.mid.x, dy = a.mid.y - cand.mid.y;
-    return aligned || Math.hypot(dx, dy) < FIN.minSiteGap;
-  });
-}
-
-/**
- * The part's bed-contact points and its area-weighted centre of mass.
- *
- * Contact comes from VERTICES under BED_EPS, not from bed-flagged faces: a part
- * tilted onto an edge has no face on the plate at all, which is exactly the case
- * the bed pad exists for.
- */
-function bedContact(topo, result, rot) {
-  const { pos, nFaces, area } = topo;
-  const { x: ox, y: oy, z: oz } = result.offset;
-  let mx = 0, my = 0, mw = 0;
-  const pts = [];
-  for (let f = 0; f < nFaces; f++) {
-    let gx = 0, gy = 0;
-    for (let i = 0; i < 3; i++) {
-      const o = f * 9 + i * 3;
-      const x = pos[o], y = pos[o + 1], z = pos[o + 2];
-      const wx = rot[0] * x + rot[3] * y + rot[6] * z + ox;
-      const wy = rot[1] * x + rot[4] * y + rot[7] * z + oy;
-      const wz = rot[2] * x + rot[5] * y + rot[8] * z + oz;
-      gx += wx; gy += wy;
-      if (wz < BED_EPS) pts.push([wx, wy]);
-    }
-    mx += (gx / 3) * area[f]; my += (gy / 3) * area[f]; mw += area[f];
-  }
-  if (mw > 0) { mx /= mw; my /= mw; }
-  return { pts, mx, my };
-}
-
-/**
- * HOW the part meets the plate: on a face, on an edge, or on a single point.
- *
- * This is the question neither support mode was asking, and it is the one that
- * explains hub_post_foot. That part has 0.0 mm^2 of bed contact at EVERY tilt
- * from 0 to 165 degrees -- it balances on the tip of its own tapered foot -- so
- * every overhang on it sits 70-100mm in the air. Stabilize finds nothing to grip
- * and Prop wants a 100mm scaffold, and both then reported some local reason
- * ("no flat face", "part in the way") that sent the user off tuning the wrong
- * thing. The actionable truth is upstream of both: nothing you add to a part
- * balanced on a point will hold it, because the support has nothing to work
- * against. Rotate it until it sits down.
- *
- * A tilted-onto-an-EDGE part is the flagship Stabilize case and must not be
- * caught by this -- it also has ~0 bed area, but its contact is a long line, not
- * a dot. So the discriminator is the footprint's extent, not its area.
- */
-const POINT_FOOTPRINT = 2.0;      // mm; contact narrower than this is a point
-
-function seatingOf(result, contactPts) {
-  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-  for (const [x, y] of contactPts) {
-    if (x < minX) minX = x; if (x > maxX) maxX = x;
-    if (y < minY) minY = y; if (y > maxY) maxY = y;
-  }
-  const span = contactPts.length
-    ? Math.hypot(maxX - minX, maxY - minY) : 0;
-  // Area decides `face`, because a part can sit on a wide footprint of many
-  // separate little pads; extent decides point-vs-edge, because those two differ
-  // in shape at the same (~zero) area.
-  const kind = result.bedArea >= FIN.padMinArea ? 'face'
-    : span < POINT_FOOTPRINT ? 'point' : 'edge';
-  return { kind, span, bedArea: result.bedArea };
-}
-
-/**
- * The ANGLED perpendicular wedge -- the grip support for a LEANING face a
- * straight-up prop cannot reach.
- *
- * When a wide/long part is tilted steeply (a 300mm plate at 60deg), it leans out
- * OVER the vertical path a prop would need, so prop.js reports every station
- * `blocked` and the overhang goes unserved. The fix is not a vertical wall but a
- * thin WEDGE that fills the open triangular gap between the leaning underside and
- * the bed: its broad face is perpendicular to the part (edge-on, thin across the
- * face `u`), its top rides the underside `gap` below, and it drops to the plate --
- * so it clears the lean instead of driving through it. Tiled across the face at a
- * coverage pitch, this is the "row of fins" a must-tilt plate needs, and it stays
- * the same perpendicular T-rib Matthew approved on the cube.
- */
-const PERP = {
-  th: 1.2,        // wedge thickness (thin across the face)
-  gap: 0.2,       // breakaway clearance under the contact (matches PROP/FIN)
-  footHalf: 3.0,  // foot flange half-width past the wedge, each side
-  footH: 0.6,
-  pitch: 24.0,    // mm between wedges across the face (a ROW, not a wall of plastic)
-  tStep: 1.5,     // sampling step up the face
-  minH: 2.0,      // skip a wedge shorter than this
-  inset: 2.0,     // keep wedges off the very edges of the patch
-  maxRow: 14,     // hard cap on wedges per patch, so a wide face never sprays
-  // A wedge is for a BROAD leaning face props can't reach. Below this face area
-  // (or u-extent) it is a small/curved patch better left to props or draw-mode --
-  // wedging it just sprays spikes (the hook's curved arm).
-  minArea: 500,
-  minWidth: 22,
-};
-
-/** Push a closed solid, flipping winding to outward if its signed volume is negative. */
-function pushSolid(local, out) {
-  let V = 0;
-  for (let i = 0; i < local.length; i += 3) {
-    const a = local[i], b = local[i + 1], c = local[i + 2];
-    V += (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2])
-        + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6;
-  }
-  if (V < 0) for (let i = 0; i < local.length; i += 3) out.push(local[i], local[i + 2], local[i + 1]);
-  else for (const v of local) out.push(v);
-}
-
-/** Extrude a planar ring (a list of [x,y,z]) by +/- half along the horizontal uDir. */
-function extrudeRing(ring, uDir, half, out) {
-  const n = ring.length;
-  const lo = ring.map((p) => [p[0] - uDir.x * half, p[1] - uDir.y * half, p[2]]);
-  const hi = ring.map((p) => [p[0] + uDir.x * half, p[1] + uDir.y * half, p[2]]);
-  const local = [];
-  for (let i = 0; i < n; i++) {
-    const j = (i + 1) % n;
-    local.push(lo[i], lo[j], hi[j], lo[i], hi[j], hi[i]);
-  }
-  for (let i = 1; i < n - 1; i++) {          // convex fan caps (a monotone wedge is convex)
-    local.push(hi[0], hi[i], hi[i + 1], lo[0], lo[i + 1], lo[i]);
-  }
-  pushSolid(local, out);
-}
-
-/** A flat foot flange under the wedge's bed footprint (a -> b at z=0). */
-function emitFoot(a, b, uDir, out) {
-  const sx = b[0] - a[0], sy = b[1] - a[1];
-  const L = Math.hypot(sx, sy);
-  if (L < 1e-6) return;
-  const ux = sx / L, uy = sy / L;                 // along the run (bed footprint)
-  const hw = PERP.th / 2 + PERP.footHalf, hl = L / 2 + PERP.footHalf;
-  const cx = (a[0] + b[0]) / 2, cy = (a[1] + b[1]) / 2;
-  const P = (s, w, z) => [cx + ux * s + uDir.x * w, cy + uy * s + uDir.y * w, z];
-  const rect = [[-hl, -hw], [hl, -hw], [hl, hw], [-hl, hw]];
-  const lo = rect.map(([s, w]) => P(s, w, 0)), hi = rect.map(([s, w]) => P(s, w, PERP.footH));
-  const local = [];
-  for (let i = 0; i < 4; i++) { const j = (i + 1) % 4; local.push(lo[i], lo[j], hi[j], lo[i], hi[j], hi[i]); }
-  for (let i = 1; i < 3; i++) local.push(hi[0], hi[i], hi[i + 1], lo[0], lo[i + 1], lo[i]);
-  pushSolid(local, out);
-}
-
-/**
- * Is a wedge at this u standable AND uninterrupted by a bore? Two conditions:
- *   - its first contiguous contact run (from the bed up) is tall enough to matter;
- *   - the face does NOT resume ABOVE a gap -- material / void / material is a BORE
- *     punched through the face, and a column there dies at the void (the angle-
- *     bracket bug). A clean top is material / void / END (past the top), which is
- *     fine. The resume must persist a couple of samples so a sliver gap in the
- *     triangulation is not mistaken for a hole.
- */
-function columnClear(p, u) {
-  const nT = Math.max(2, Math.ceil((p.t1 - p.t0) / PERP.tStep));
-  let started = false, ended = false, top = 0, resume = 0;
-  for (let i = 0; i <= nT; i++) {
-    const t = p.t0 + ((p.t1 - p.t0) * i) / nT;
-    const dev = patchProbe(p, u, t);
-    if (dev === null) { if (started) ended = true; continue; }
-    if (ended) { resume++; continue; }                      // material above a gap
-    started = true;
-    const z = zAt(p, dev, t) - PERP.gap;
-    if (z > top) top = z;
-  }
-  return top >= PERP.minH && resume < 2;
-}
-
-/**
- * The u positions to stand wedges at across [lo, hi]. With no hole this is the
- * old even row (round(span/pitch) columns). A bore/slot splits the standable u's
- * into BANDS on either side of it; each band gets its own row, so a drawn or auto
- * fin lands as two fins FLANKING the bore instead of one column dying at the void
- * (a tilted bore prints poorly and must not be finned -- rotate hole-up or draw).
- */
-export function perpColumns(p, lo, hi, pitch) {
-  const span = hi - lo;
-  if (span <= 0) return [];
-  const nS = Math.max(2, Math.ceil(span / 1.0));
-  const clear = [];
-  for (let i = 0; i <= nS; i++) clear.push(columnClear(p, lo + (span * i) / nS));
-
-  // contiguous clear samples -> u-bands (the void is the gap between them)
-  const bands = [];
-  let s = -1;
-  for (let i = 0; i <= nS; i++) {
-    if (clear[i] && s < 0) s = i;
-    if (s >= 0 && (!clear[i] || i === nS)) {
-      const e = clear[i] ? i : i - 1;
-      if (e >= s) bands.push([lo + (span * s) / nS, lo + (span * e) / nS]);
-      s = -1;
-    }
-  }
-  if (!bands.length) bands.push([lo, hi]);   // nothing read as clear: fall back to one row
-
-  const cols = [];
-  for (const [a, b] of bands) {
-    const w = b - a;
-    const m = Math.max(1, Math.min(PERP.maxRow, Math.round(w / pitch)));
-    for (let k = 0; k < m; k++) cols.push(m === 1 ? (a + b) / 2 : a + (w * k) / (m - 1));
-  }
-  return cols.slice(0, PERP.maxRow);
-}
-
-/**
- * Tile perpendicular wedges across one down-facing patch. Returns
- * { triangles, tines, count }.
- */
-function buildPerpFins(p, topo, rot, offset, opts = {}) {
-  const uDir = { x: p.u.x, y: p.u.y };            // horizontal, across the face (unit)
-  const half = PERP.th / 2;
-  const lo = p.u0 + PERP.inset, hi = p.u1 - PERP.inset;
-  if (hi - lo <= 0) return { triangles: [], tines: 0, count: 0 };
-  const out = [];
-  let tineTotal = 0, count = 0;
-
-  for (const uc of perpColumns(p, lo, hi, opts.pitch ?? PERP.pitch)) {
-    // contact profile up the face at this u (stop at the first hole after starting)
-    const contact = [];
-    const nT = Math.max(2, Math.ceil((p.t1 - p.t0) / PERP.tStep));
-    for (let i = 0; i <= nT; i++) {
-      const t = p.t0 + ((p.t1 - p.t0) * i) / nT;
-      const dev = patchProbe(p, uc, t);
-      if (dev === null) { if (contact.length) break; else continue; }
-      const w = patchPoint(p, dev, uc, t);
-      if (w[2] > 0.3) contact.push(w);
-    }
-    if (contact.length < 2) continue;
-    const top = contact.map((w) => [w[0], w[1], w[2] - PERP.gap]);
-    if (Math.max(...top.map((q) => q[2])) < PERP.minH) continue;
-
-    // ring: up the bed edge, along the top, down the bed edge (closes along the bed)
-    const ring = [[top[0][0], top[0][1], 0], ...top,
-                  [top[top.length - 1][0], top[top.length - 1][1], 0]];
-    const before = out.length;
-    extrudeRing(ring, uDir, half, out);
-    emitFoot([top[0][0], top[0][1], 0], [top[top.length - 1][0], top[top.length - 1][1], 0], uDir, out);
-    if (opts.tines !== false) tineTotal += emitTines(contact, null, topo, rot, offset, out, tineStepFor(opts.tineDensity));
-    if (out.length > before) count++;
-  }
-  return { triangles: out, tines: tineTotal, count };
-}
-
-/**
- * Does a prop wall already stand under this patch's footprint? Decided in space,
- * not by face index: a prop `line` is a centreline of [x,y,z] points, and the
- * patch's world footprint is the xy bbox of its four (u,t) corners. If any prop
- * point lands in that box (plus a small margin) the patch is already served and a
- * wedge would just double it.
- */
-function propServesPatch(p, props) {
-  if (!props || !props.length) return false;
-  let xLo = Infinity, xHi = -Infinity, yLo = Infinity, yHi = -Infinity;
-  for (const u of [p.u0, p.u1]) for (const t of [p.t0, p.t1]) {
-    const q = patchPoint(p, 0, u, t);
-    if (q[0] < xLo) xLo = q[0]; if (q[0] > xHi) xHi = q[0];
-    if (q[1] < yLo) yLo = q[1]; if (q[1] > yHi) yHi = q[1];
-  }
-  const m = 8;
-  for (const q of props) {
-    for (const pt of (q.line ?? [])) {
-      if (pt[0] >= xLo - m && pt[0] <= xHi + m && pt[1] >= yLo - m && pt[1] <= yHi + m) return true;
-    }
-  }
-  return false;
+export function applyTunables(t) {
+  if (!t) return;
+  const set = (obj, key, v) => { if (Number.isFinite(v)) obj[key] = v; };
+  set(FIN, 'padH', t.padH);
+  set(PAD, 'grab', t.padGrab);
+  if (['auto', 'light', 'sure', 'custom'].includes(t.padStyle)) PAD.style = t.padStyle;
+  if (t.padCustom) for (const k of Object.keys(PAD.custom)) set(PAD.custom, k, t.padCustom[k]);
+  set(PROP, 'gap', t.propGap);
+  // Tines per wall, exact (0 = off, the spacing rules decide): the tine coupon asks
+  // how few still hold. Calibration only.
+  if (Number.isInteger(t.tinesPerWall) && t.tinesPerWall >= 0) PROP.tinesPerWall = t.tinesPerWall;
+  // The wedge keeps its own copy of the clearance, so the Support gap field and the
+  // PETG profile never reached it -- not even on the main thread, where everything
+  // else worked. One clearance, applied everywhere it is spelled.
+  set(PERP, 'gap', t.propGap);
+  // Not a clearance, but module state with the same Worker problem.
+  if (CUTOUT_PATTERNS.includes(t.cutout)) CUT.pattern = t.cutout;
 }
 
 /**
  * Generate supports for the part in its current orientation.
  *
  * @param opts.mode     'prop' (the default: a vertical breakaway wall under
- *                      each overhang), 'stabilize' (the Brace: a tined fin
- *                      against toppling; docs/FIN-SPEC.md), or 'auto' (props for
- *                      the overhangs PLUS bracing fins if the part would topple)
+ *                      each overhang, no tines) or 'auto' (tined walls PLUS
+ *                      wedges under the faces no wall reached). 'stabilize' is
+ *                      an old name for 'auto'; any other mode builds 'prop'.
  * @param opts.bedPad   add the pad when bed contact is too small to hold
  */
 export function buildFins(topo, result, rot, opts = {}) {
+  const built = buildFinsAndBraces(topo, result, rot, opts);
+  // A piece of the part that starts in mid-air (a cut clean through, a loose
+  // body) needs saying no matter what was placed: see floatingPieces.
+  built.floating = floatingPieces(topo, result, rot);
+  return built;
+}
+
+function buildFinsAndBraces(topo, result, rot, opts = {}) {
+  applyTunables(opts.tunables);
+  const built = buildFinsCore(topo, result, rot, opts);
+  // Sway braces are an optional ADD-ON to whatever the mode placed (sway.js): a
+  // tall part still needs its overhangs held, and bracing its sides is a
+  // separate job on separate faces.
+  if (!opts.sway?.on) return built;
+  // Braces run LAST, so everything this mode placed is already on the plate: hand
+  // the props' and wedges' centrelines over as things to stand clear of. Fused to
+  // one of those, a brace is no longer a piece that snaps off by itself.
+  const walls = (built.fins ?? []).map((f) => f.line).filter((l) => Array.isArray(l) && l.length);
+  const sw = buildSwayBraces(topo, result, rot,
+    { ...opts.sway, tines: opts.tines, layerHeight: opts.layerHeight, avoid: { walls } });
+  // Each brace also gets a fin record: the Auto view draws and exports only the
+  // triangles some record claims (per-fin removal), so an unrecorded brace would
+  // be counted in the readout but never shown or written out.
+  const base = built.triangles.length;
+  const fins = built.fins ?? [];
+  let id = fins.reduce((m, f) => Math.max(m, (f.id ?? -1) + 1), fins.length);
+  const braces = sw.ribs.map((r) => ({
+    height: r.height, length: r.depth, tines: r.tines, rows: 0, stilt: 0, lean: 0, bearing: 0, site: null,
+    id: id++, kind: 'sway',
+    triRanges: [[r.triRange[0] + base, r.triRange[1] + base]],
+    line: r.foot, span: r.depth,
+  }));
+  return {
+    ...built,
+    triangles: [...built.triangles, ...sw.triangles],
+    fins: [...fins, ...braces],
+    sway: { count: sw.count, tines: sw.tines, skipped: sw.skipped, reason: sw.reason,
+            // The outlines travel back so a brace the user then clicks by hand can be
+            // checked against these: Auto builds in the Worker, so the page has no
+            // other way to know where they stand. Plain data, structured-cloneable.
+            braces: (sw.ribs ?? []).map((r) => ({ foot: r.foot, halfW: r.halfW, th: r.th,
+                                          height: r.height, levels: r.levels })) },
+  };
+}
+
+function buildFinsCore(topo, result, rot, opts = {}) {
   const mode = opts.mode ?? 'prop';
-  const maxFins = opts.maxFins ?? FIN.maxFins;
-  const out = [];
   const padOut = [];
 
   // THE COMBINED SUPPORT IS A TINED PERPENDICULAR RIB (prop.js), not the old
@@ -1246,8 +167,8 @@ export function buildFins(topo, result, rot, opts = {}) {
   // overhang, part-attached where a floor sits under the overhang -- all watertight
   // and weld-certified. Tines default ON here (that is what makes it "combined"
   // rather than a plain breakaway prop); 'prop' proper leaves them off. The old
-  // leaning-fin machinery below (rankSites / chooseSpan / buildFin) is no longer
-  // reached from these modes and is kept only for reference / Draw-mode reuse.
+  // leaning-fin machinery (rankSites / chooseSpan / buildFin) was deleted once
+  // nothing reached it; git history has it.
   if (mode === 'auto' || mode === 'stabilize') {
     const withTines = opts.tines ?? true;
     // Wide-face coverage (0 sparse .. 1 dense) drives how densely a broad face is
@@ -1257,7 +178,14 @@ export function buildFins(topo, result, rot, opts = {}) {
     // tests/coverage.test.js.
     const coverage = Math.max(0, Math.min(1, opts.coverage ?? FIN.coverDefault));
     const covPitch = coverPitch(coverage);
-    const base = buildFins(topo, result, rot, { ...opts, mode: 'prop', tines: withTines });
+    // The wedge candidates: broad down-facing patches. Found before the props so
+    // a raster wall can be kept off the ones the normal pass leaves to a wedge
+    // (wedgeVeto).
+    const wedgeable = findWallPatches(topo, rot, result.offset).filter((p) =>
+      p.n.z < -0.05 && p.area >= PERP.minArea && (p.u1 - p.u0) >= PERP.minWidth);
+    const wedgeOpts = { tines: withTines, pitch: covPitch, tineDensity: opts.tineDensity };
+    const base = buildFinsCore(topo, result, rot, { ...opts, mode: 'prop', tines: withTines,
+      rasterVeto: wedgeVeto(wedgeable, topo, rot, result.offset, wedgeOpts) });
 
     // Add ANGLED WEDGES on grippable down-facing patches that NO prop wall
     // reached -- the wide/long leaning face where a vertical wall is blocked by
@@ -1265,184 +193,138 @@ export function buildFins(topo, result, rot, opts = {}) {
     // patch's footprint), not by face-index, because a wall-patch and an overhang
     // region grow from different seeds and don't share a face set. Patches props
     // already serve are left untouched, so the reachable parts don't change.
-    const patches = findWallPatches(topo, rot, result.offset);
     const wedgeTris = [];
-    let wedgeTines = 0, wedgeCount = 0, wedgedPatches = 0;
-    for (const p of patches) {
-      if (p.n.z >= -0.05) continue;                 // downward faces only
-      if (p.area < PERP.minArea || (p.u1 - p.u0) < PERP.minWidth) continue; // broad faces only
+    const wedgeRecs = [];   // per-wedge records, triRange into wedgeTris (pre-offset)
+    let wedgeTines = 0;
+    let wedgedPatches = 0;
+    for (const p of wedgeable) {                    // downward, broad faces only
       if (propServesPatch(p, base.props)) continue; // a prop already stands under it
-      const w = buildPerpFins(p, topo, rot, result.offset, { tines: withTines, pitch: covPitch, tineDensity: opts.tineDensity });
+      const w = buildPerpFins(p, topo, rot, result.offset, wedgeOpts);
       if (!w.count) continue;
+      // Offset each wedge's range from its per-call `out` into the merged
+      // wedgeTris array, so the range lands correctly in the final triangles.
+      const off = wedgeTris.length;
       for (const v of w.triangles) wedgeTris.push(v);
-      wedgeTines += w.tines; wedgeCount += w.count; wedgedPatches++;
+      for (const wd of w.wedges) {
+        wedgeRecs.push({ triRange: [wd.triRange[0] + off, wd.triRange[1] + off],
+                         line: wd.line, height: wd.height, span: wd.span });
+      }
+      wedgeTines += w.tines; wedgedPatches++;
     }
+    const wedgeCount = wedgeRecs.length;
 
-    const fins = [...base.fins];
-    for (let i = 0; i < wedgeCount; i++) {
-      fins.push({ height: 0, length: 0, tines: 0, rows: 0, stilt: 0, lean: 0, bearing: 0, site: null });
+    // LAST RESORT: short walls under the regions no wall or wedge reached (issue
+    // #121's strut lattice). Only bare regions, so a served part is unchanged.
+    // `lastResort: false` skips it, like `raster: false` (the tests' baselines).
+    // A point-seated part with the pad off gets no walls (the prop-mode gate below);
+    // the last resort must not build them back.
+    const noShort = opts.lastResort === false || (base.seating?.kind === 'point' && !base.pad);
+    const short = noShort ? { triangles: [], props: [], served: [], tines: 0 } : lastResortWalls(topo, result, rot, { ...opts, tines: withTines, coverage },
+                                  base.servedRegions ?? [], wedgeTris, [...base.triangles, ...wedgeTris]);
+
+    // Unified per-fin array: each entry carries its triangle segment(s) into the
+    // final `built.triangles`, so the UI can address and remove an individual fin
+    // by its geometry. Prop ranges already index `base.triangles` (the prefix of
+    // the merged array); wedge ranges are offset past it by base.triangles.length.
+    // base.fins[i] is order-aligned with base.props[i] (it is built from it), so
+    // the existing stats fields carry over and only triRanges/id/kind are added.
+    const baseLen = base.triangles.length;
+    const fins = base.props.map((q, i) => ({
+      ...(base.fins[i] ?? {}),                     // existing stats (height/length/tines/...)
+      id: q.id ?? i, kind: 'prop',
+      triRanges: q.triRanges ?? [],
+      line: q.line, span: q.span, height: q.height,
+    }));
+    let wid = fins.length;
+    for (const wd of wedgeRecs) {
+      fins.push({
+        height: wd.height, length: wd.span, tines: 0, rows: 0, stilt: 0, lean: 0, bearing: 0, site: null,
+        id: wid++, kind: 'wedge',
+        triRanges: [[wd.triRange[0] + baseLen, wd.triRange[1] + baseLen]],
+        line: wd.line, span: wd.span,
+      });
     }
+    const shortAt = baseLen + wedgeTris.length;
+    // Into the merged triangles, for fins AND props (prototype/examples/compare.js
+    // reads props' ranges against result.triangles).
+    const shortProps = short.props.map((q) => ({ ...q, triRanges: q.triRanges.map(([a, b]) => [a + shortAt, b + shortAt]) }));
+    for (const q of shortProps) {
+      fins.push({
+        height: q.height, length: q.span, tines: q.tines ?? 0, rows: 0, stilt: 0, lean: 0, bearing: 0, site: null,
+        id: wid++, kind: 'prop', short: true,
+        triRanges: q.triRanges,
+        line: q.line, span: q.span,
+      });
+    }
+    const servedRegions = [...(base.servedRegions ?? []), ...short.served];
     return {
       ...base, mode,
-      triangles: [...base.triangles, ...wedgeTris],
+      triangles: [...base.triangles, ...wedgeTris, ...short.triangles],
+      props: [...base.props, ...shortProps],
+      servedRegions,
       fins,
-      tines: (base.tines ?? 0) + wedgeTines,
+      tines: (base.tines ?? 0) + wedgeTines + short.tines,
       // A tined rib/wedge IS the combined support (a "brace"); a tineless one is a
       // plain prop. Report the split so the stress harness / UI metrics keep working.
       braceCount: withTines ? fins.length : wedgeCount,
-      propCount: withTines ? 0 : base.fins.length,
-      unserved: Math.max(0, (base.unserved ?? 0) - wedgedPatches),
+      propCount: withTines ? 0 : base.fins.length + short.props.length,
+      unserved: wedgedPatches ? unservedAfterWedges(topo, rot, result, servedRegions, wedgeTris)
+                              : (base.unserved ?? 0) - short.served.length,
     };
   }
 
-  // Prop is its own support, built by its own module -- a wall UNDER each
-  // overhang with no tines, which needs none of the face-finding below. Handled
-  // first so the patch search is not even run for it.
-  if (mode === 'prop') {
-    const contact = bedContact(topo, result, rot);
-    const seating = seatingOf(result, contact.pts);
-    const pad = (opts.bedPad ?? true) && result.bedArea < FIN.padMinArea
-      ? buildPad(contact.pts, seatedPartTris(topo, rot, result.offset), padOut) : null;
-    // A part seated on a POINT gets no props -- nothing standing on the plate
-    // can hold a part that never touches it -- UNLESS the bed pad is on, in
-    // which case the pad is what seats it and the walls have something to work
-    // against. That is not speculation, it is the shelter workflow this whole
-    // tool descends from: hub.py's apex hub is a SPHERE-bottomed part with
-    // 0.0 mm2 of bed contact, and it printed cleanly as core pad + two webs
-    // (tools/shelter/hub.py --supports). The first version of this gate
-    // refused it -- the flagship real-world part, the one breakaway.py was
-    // written for -- while the readout said "rotate", which is exactly the
-    // advice the printed evidence contradicts. Refuse only when the user has
-    // turned the pad off.
-    const built = seating.kind === 'point' && !pad
-      ? noProps() : buildProps(topo, result, rot, opts);
-    return {
-      triangles: built.triangles, padTriangles: padOut, pad, mode,
-      fins: built.props.map((q) => ({
-        height: q.height, length: q.span, tines: 0, rows: 0,
-        stilt: 0, lean: 0, bearing: 0, site: null,
-      })),
-      props: built.props,
-      volume: built.volume,
-      // Prop's own reasons, unflattened. These USED to be squashed into the
-      // stabilize-shaped object below, which keeps only `blocked` -- so noLine,
-      // notALine, stub, degenerate and buried were dropped before anything could
-      // read them. M5 was then measured through that channel and recorded as
-      // working on parts where it built nothing: hub_post_foot reported
-      // `blocked: 0` at 0 degrees when the real reason was `buried: 1`.
-      // Whatever explains a failure has to survive the trip to the UI.
-      skipped: built.skipped,
-      rejected: { blocked: built.skipped.blocked, tooFewTines: 0,
-                  sites: result.regions.length,
-                  tried: result.regions.length },
-      patchCount: 0, patchStats: {}, tines: built.tines ?? 0,
-      servedRegions: built.servedRegions ?? [],
-      // regions minus SERVED REGIONS, not minus the prop count: a region can
-      // yield several walls now that it is split into sub-patches, and the old
-      // subtraction would go negative.
-      unserved: result.regions.length - built.served,
-      sagRisk: built.sagRisk ?? false,
-      seating,
-      tip: null,
-    };
-  }
-
-  const patchStats = {};
-  const patches = findWallPatches(topo, rot, result.offset, patchStats);
-
-  // where the part's mass is, versus where it is actually touching down
-  const { pts: contact, mx, my } = bedContact(topo, result, rot);
-
-  let tip = null;
-  if (contact.length) {
-    let bx = 0, by = 0;
-    for (const p of contact) { bx += p[0]; by += p[1]; }
-    bx /= contact.length; by /= contact.length;
-    const dx = mx - bx, dy = my - by, dn = Math.hypot(dx, dy);
-    // A well-balanced part has no lean worth reading, and normalising the noise
-    // would aim the fins at a rounding error.
-    if (dn > 0.5) tip = { x: dx / dn, y: dy / dn };
-  }
-
-  // A part sitting square on a wide face is not going anywhere -- gripping fins on
-  // its upright sides would be plastic spent holding a part that holds itself. So
-  // grip only fires when the part actually needs holding: it leans (has a `tip`),
-  // or it rests on so little bed that it would peel/topple. This is also what
-  // stops standalone Combined-fin from spraying braces on a flat, seated part.
-  const needsHolding = tip !== null || result.bedArea < FIN.padMinArea;
-  const ranked = mode === 'stabilize' && needsHolding
-    ? rankSites(patches, tip, patchStats) : [];
-
-  // Walk the ranking until enough fins EXIST, rather than picking sites up front
-  // and hoping. Choosing first and building second meant a site that turned out
-  // to have no clear window burned one of the three slots and the part came back
-  // with no fins at all -- on a tapered hub, 1 site tried and 93 candidates left
-  // untouched. Separation is therefore checked against the fins actually built.
-  const fins = [];
-  const taken = [];
-  const rejected = { blocked: 0, tooFewTines: 0, sites: 0, tried: 0 };
-
-  // Row density: only the stabilize path tiles, and only where a face is wide.
-  const coverage = mode === 'stabilize' ? (opts.coverage ?? FIN.coverDefault) : null;
-  const covPitch = coverage == null ? 0 : coverPitch(coverage);
-  let compactCount = 0;   // only these count against the maxFins "opposite corners" cap
-
-  for (const cand of ranked) {
-    if (rejected.tried >= FIN.maxSiteTries) break;
-    if (fins.length >= FIN.rowMaxTotal) break;
-    if (clashes(taken, cand.patch)) continue;
-
-    // A face wider than a couple of braces is an EDGE to line, not a corner to
-    // brace: tile a row along it at the chosen density. The compact
-    // opposite-corners cap and its score-ratio break gate only the short brace.
-    const wide = covPitch > 0 && (cand.patch.u1 - cand.patch.u0) > FIN.wideFace
-      && cand.patch.area > FIN.wideMinArea;
-    if (!wide) {
-      if (compactCount >= maxFins) break;
-      // a 2nd or 3rd fin still has to be worth its plastic next to the first
-      if (compactCount && cand.score < ranked[0].score * FIN.minScoreRatio) break;
-    }
-
-    rejected.tried++;
-    if (wide) {
-      const rowSpans = chooseSpan(cand.patch, topo, rot, result.offset, covPitch);
-      let placed = 0;
-      for (const span of rowSpans) {
-        if (fins.length >= FIN.rowMaxTotal) break;
-        const info = buildFin(cand.patch, out, span, topo, rot, result.offset,
-                              { tines: opts.tines });
-        if (info) { fins.push(info); placed++; }
-      }
-      if (placed) taken.push(cand.patch); else rejected.tooFewTines++;
-    } else {
-      const spans = chooseSpan(cand.patch, topo, rot, result.offset);
-      if (!spans.length) { rejected.blocked++; continue; }
-      let info = null;
-      for (const span of spans) {
-        info = buildFin(cand.patch, out, span, topo, rot, result.offset,
-                        { tines: opts.tines });
-        if (info) break;
-      }
-      if (info) { fins.push(info); taken.push(cand.patch); compactCount++; }
-      else rejected.tooFewTines++;
-    }
-  }
-  rejected.sites = ranked.length;
-
-  let pad = null;
-  if ((opts.bedPad ?? true) && result.bedArea < FIN.padMinArea) {
-    pad = buildPad(contact, seatedPartTris(topo, rot, result.offset), padOut);
-  }
-
+  // Prop (and any other mode) is its own support, built by its own module -- a
+  // wall UNDER each overhang with no tines.
+  const contact = bedContact(topo, result, rot);
+  const seating = seatingOf(result, contact.pts);
+  const pad = (opts.bedPad ?? true) && result.bedArea < FIN.padMinArea
+    ? buildPad(contact.pts, seatedPartTris(topo, rot, result.offset), padOut, opts.layerHeight) : null;
+  // A part seated on a POINT gets no props -- nothing standing on the plate
+  // can hold a part that never touches it -- UNLESS the bed pad is on, in
+  // which case the pad is what seats it and the walls have something to work
+  // against. That is not speculation, it is the shelter workflow this whole
+  // tool descends from: hub.py's apex hub is a SPHERE-bottomed part with
+  // 0.0 mm2 of bed contact, and it printed cleanly as core pad + two webs
+  // (tools/shelter/hub.py --supports). The first version of this gate
+  // refused it -- the flagship real-world part, the one breakaway.py was
+  // written for -- while the readout said "rotate", which is exactly the
+  // advice the printed evidence contradicts. Refuse only when the user has
+  // turned the pad off.
+  const built = seating.kind === 'point' && !pad
+    ? noProps() : buildProps(topo, result, rot, opts);
   return {
-    triangles: out, padTriangles: padOut, fins, pad, rejected,
-    patchCount: patches.length, patchStats,
-    tines: fins.reduce((a, f) => a + f.tines, 0),
-    // Stabilize does not claim to serve overhangs -- it claims to keep the part
-    // standing. Anything still red after the fins go on is the user's call:
-    // rotate further, or wait for Draw mode. Saying so is the honest version.
-    unserved: result.regions.length,
-    seating: seatingOf(result, contact),
-    tip,
+    triangles: built.triangles, padTriangles: padOut, pad, mode,
+    // Carry each prop's triangle range + identity up so per-fin removal can
+    // address an individual fin regardless of which mode produced it. The stats
+    // fields (height/length/tines/...) are preserved; triRanges/id/kind/line are
+    // additive on top of built.props (which already carry them).
+    fins: built.props.map((q) => ({
+      height: q.height, length: q.span, tines: 0, rows: 0,
+      stilt: 0, lean: 0, bearing: 0, site: null,
+      id: q.id, kind: q.kind ?? 'prop',
+      triRanges: q.triRanges ?? [], line: q.line, span: q.span,
+    })),
+    props: built.props,
+    volume: built.volume,
+    // Prop's own reasons, unflattened. These USED to be squashed into the
+    // stabilize-shaped object below, which keeps only `blocked` -- so noLine,
+    // notALine, stub, degenerate and buried were dropped before anything could
+    // read them. M5 was then measured through that channel and recorded as
+    // working on parts where it built nothing: hub_post_foot reported
+    // `blocked: 0` at 0 degrees when the real reason was `buried: 1`.
+    // Whatever explains a failure has to survive the trip to the UI.
+    skipped: built.skipped,
+    rejected: { blocked: built.skipped.blocked, tooFewTines: 0,
+                sites: result.regions.length,
+                tried: result.regions.length },
+    patchCount: 0, patchStats: {}, tines: built.tines ?? 0,
+    servedRegions: built.servedRegions ?? [],
+    // regions minus SERVED REGIONS, not minus the prop count: a region can
+    // yield several walls now that it is split into sub-patches, and the old
+    // subtraction would go negative.
+    unserved: result.regions.length - built.served,
+    sagRisk: built.sagRisk ?? false,
+    seating,
+    tip: null,
   };
 }

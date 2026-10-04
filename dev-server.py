@@ -7,11 +7,14 @@ caching turned OFF.
 apply heuristic caching to ES modules. Editing a module and reloading then runs
 the OLD code, which looks exactly like a logic bug and wastes an afternoon.
 
-    python3 dev-server.py [port]        # http://localhost:8731/
+    python3 dev-server.py [port]            # http://localhost:8731/
+    python3 dev-server.py --host 0.0.0.0    # reach from other devices on the LAN
 """
+import argparse
 import functools
 import http.server
 import os
+import socket
 import sys
 
 
@@ -26,12 +29,40 @@ class NoCacheHandler(http.server.SimpleHTTPRequestHandler):
         sys.stderr.write(f"{self.command} {self.path} -> {args[1]}\n")
 
 
+def _lan_ip():
+    """Best-effort LAN address for the "reachable at" hint. No packets are sent."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))  # pick a route; the OS resolves the local end without sending
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except OSError:
+        return None
+
+
 def main():
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8731
-    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web')
+    parser = argparse.ArgumentParser(
+        description='Support Fins no-cache dev server.',
+        epilog='Bind 0.0.0.0 (or ::) to reach the server from other devices on your LAN.',
+    )
+    parser.add_argument('port', nargs='?', type=int, default=8731,
+                        help='port to listen on (default: 8731)')
+    parser.add_argument('--host', default='127.0.0.1',
+                        help='address to bind (default: 127.0.0.1; 0.0.0.0 exposes it to the LAN)')
+    args = parser.parse_args()
+
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'web')  # serve ./web from the repo root
     handler = functools.partial(NoCacheHandler, directory=root)
-    print(f"support-fins dev server: http://localhost:{port}/  (serving {root})")
-    http.server.ThreadingHTTPServer(('127.0.0.1', port), handler).serve_forever()
+    print(f"support-fins dev server: http://localhost:{args.port}/  (serving {root})")
+    wildcard = args.host in ('0.0.0.0', '::', '')
+    if wildcard:
+        ip = _lan_ip()
+        if ip:
+            print(f"On other devices on your LAN, open http://{ip}:{args.port}/")
+    bind = '' if wildcard else args.host
+    sys.stdout.flush()  # ensure the lines above land in a redirected log immediately (e.g. headless RPi)
+    http.server.ThreadingHTTPServer((bind, args.port), handler).serve_forever()
 
 
 if __name__ == '__main__':

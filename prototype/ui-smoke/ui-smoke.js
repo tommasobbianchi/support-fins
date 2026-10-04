@@ -1,0 +1,476 @@
+/**
+ * UI smoke run: drive the real page in headless Chrome through a fixed script of
+ * clicks (load, rotate, fins, remove a fin, pad styles, draw a wall, undo/redo,
+ * strength arrow, lay flat, suggest orientation, volume...) and dump what is
+ * observable after every step -- panel text, control state, triangle counts +
+ * checksums of the fins / pad / drawn walls, what the scene shows, the export
+ * geometry, and any console error. Two dumps of the same script diff cleanly, so
+ * a UI refactor can be checked for "no behaviour change" (compare.js).
+ *
+ *   deno run -A prototype/ui-smoke/ui-smoke.js --web web --out run.json [--model cone]
+ *
+ * The page is served here (web/ plus prototype/stress/models/ at /models/), so no
+ * dev server and no gitignored dev-models are needed. CHROME overrides the browser.
+ */
+import puppeteer from 'npm:puppeteer-core@24';
+import { serveDir } from 'jsr:@std/http@1/file-server';
+import { parseArgs } from 'jsr:@std/cli@1/parse-args';
+import { dirname, fromFileUrl, join, resolve } from 'jsr:@std/path@1';
+
+const args = parseArgs(Deno.args, { string: ['web', 'out', 'model'], default: { model: 'cone' } });
+const ROOT = resolve(dirname(fromFileUrl(import.meta.url)), '../..');
+const WEB = resolve(args.web ?? join(ROOT, 'web'));
+const MODELS = join(ROOT, 'prototype/stress/models');
+const model = args.model.includes('/') ? args.model : `models/${args.model}.stl`;
+
+const server = Deno.serve({ port: 0, hostname: '127.0.0.1', onListen() {} }, (req) => {
+  const path = new URL(req.url).pathname;
+  const res = path.startsWith('/models/')
+    ? serveDir(req, { fsRoot: MODELS, urlRoot: 'models', quiet: true })
+    : serveDir(req, { fsRoot: WEB, quiet: true });
+  return res.then((r) => { r.headers.set('Cache-Control', 'no-store'); return r; });
+});
+const base = `http://127.0.0.1:${server.addr.port}`;
+
+const browser = await puppeteer.launch({
+  executablePath: Deno.env.get('CHROME')
+    ?? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  headless: true,
+  args: ['--use-angle=metal', '--enable-webgl', '--ignore-gpu-blocklist'],
+  defaultViewport: { width: 1400, height: 900 },
+});
+const page = await browser.newPage();
+const errors = [];
+page.on('pageerror', (e) => errors.push(String(e)));
+page.on('console', (m) => {
+  if (m.type() === 'error' || m.type() === 'warn') errors.push(`${m.type()}: ${m.text()}`);
+});
+page.on('dialog', async (d) => { errors.push(`dialog: ${d.message()}`); await d.dismiss(); });
+
+const steps = [];
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const log = (s) => Deno.stderr.writeSync(new TextEncoder().encode(s + '\n'));
+
+/** Wait for any support build in flight to land. */
+async function settle() {
+  await sleep(150);
+  for (let i = 0; i < 200; i++) {
+    const busy = await page.evaluate(() =>
+      document.getElementById('s-fins')?.textContent === 'generating supports…'
+      || document.getElementById('spinner').classList.contains('show'));
+    if (!busy) break;
+    await sleep(100);
+  }
+  await sleep(250);
+}
+
+async function snap(name) {
+  await settle();
+  const s = await page.evaluate(() => {
+    const SKIP = new Set(['s-time', 'fps']);        // timings: never equal run to run
+    const dom = {};
+    for (const e of document.querySelectorAll('[id]')) {
+      if (SKIP.has(e.id)) continue;
+      const r = {};
+      if (e.hidden) r.h = 1;
+      if (e.disabled) r.d = 1;
+      if (e.className && typeof e.className === 'string') r.c = e.className;
+      if ('value' in e && e.tagName !== 'BUTTON' && e.tagName !== 'LI') {
+        r.v = e.type === 'checkbox' ? e.checked : e.value;
+      }
+      if (e.children.length === 0 || e.id.startsWith('s-') || e.id.endsWith('-note')
+          || e.id === 'suggest-list' || e.id === 'picker-list') {
+        r.t = e.textContent.trim().replace(/\s+/g, ' ').slice(0, 400);
+      }
+      if (e.title && e.id === 's-fin-info') r.title = e.title;
+      if (e.id === 'suggest-list') {
+        r.active = [...e.children].findIndex((c) => c.classList.contains('active'));
+      }
+      if (e.tagName === 'SELECT') r.opts = [...e.options].map((o) => o.textContent).join('|');
+      dom[e.id] = r;
+    }
+    const sf = window.__sf;
+    const sum = (tris) => {
+      let a = 0;
+      for (const t of tris) a += t[0] * 1.3 + t[1] * 1.7 + t[2] * 2.1;
+      return Math.round(a * 10) / 10;
+    };
+    const scene = sf.part?.parent;
+    const vis = [], mats = new Set();
+    scene?.traverse((o) => {
+      if (!(o.isMesh || o.isLine || o.isLineSegments)) return;
+      let v = o.visible;
+      for (let p = o.parent; v && p; p = p.parent) v = p.visible;
+      if (v) {
+        vis.push(`${o.type}:${o.material?.color?.getHexString?.() ?? ''}:`
+          + `${o.geometry?.getAttribute('position')?.count ?? 0}`);
+      }
+      if (o.isMesh && o.material?.color) {
+        mats.add(`${o.material.color.getHexString()}:${o.material.transparent ? 't' : 'o'}:`
+          + `${o.material.opacity}`);
+      }
+    });
+    const q = sf.part?.quaternion;
+    const exp = sf.buildExportGeometry();
+    return {
+      dom,
+      quat: q ? [q.x, q.y, q.z, q.w].map((v) => Math.round(v * 1e4) / 1e4) : null,
+      finTris: sf.finTris.length, finSum: sum(sf.finTris),
+      padTris: sf.padTris.length, padSum: sum(sf.padTris),
+      drawnTris: sf.drawnTris.length, drawnSum: sum(sf.drawnTris),
+      walls: sf.drawnWalls.map((w) => ({ kind: w.kind ?? 'wall', ok: w.ok })),
+      export: exp && { part: exp.partTris.length, fins: exp.finTris.length, base: exp.base,
+                       sum: sum(exp.finTris) },
+      vis: vis.sort(),
+      mats: [...mats].sort(),
+      cursor: document.querySelector('#viewport canvas').style.cursor,
+    };
+  });
+  steps.push({ name, ...s });
+  log(`${name}: fins=${s.finTris} pad=${s.padTris} drawn=${s.drawnTris} | ${s.dom['s-fins']?.t}`);
+}
+
+const click = (id) => page.evaluate((id) => document.getElementById(id).click(), id);
+const setVal = (id, v, ev = 'change') => page.evaluate((id, v, ev) => {
+  const e = document.getElementById(id);
+  if (e.type === 'checkbox') e.checked = v; else e.value = v;
+  e.dispatchEvent(new Event(ev, { bubbles: true }));
+}, id, v, ev);
+
+/** Screen point of a world point returned by `body` (a function body of sf, THREE). */
+function screenOf(body) {
+  return page.evaluate(async (body) => {
+    const THREE = await import('three');
+    const sf = window.__sf;
+    const p = new THREE.Vector3(...new Function('sf', 'THREE', body)(sf, THREE));
+    p.project(sf.camera);
+    const r = document.querySelector('#viewport canvas').getBoundingClientRect();
+    return { x: r.left + (p.x + 1) / 2 * r.width, y: r.top + (1 - p.y) / 2 * r.height };
+  }, body);
+}
+/** Hover then click the world-space centroid of part face `pick(sf)`. */
+async function clickFace(pick) {
+  const p = await screenOf(`
+    const g = sf.part.geometry.getAttribute('position'); sf.part.updateMatrixWorld();
+    const f = (${pick})(sf);
+    const c = new THREE.Vector3();
+    for (let i = 0; i < 3; i++) c.add(new THREE.Vector3().fromBufferAttribute(g, f * 3 + i));
+    c.multiplyScalar(1 / 3); sf.part.localToWorld(c); return [c.x, c.y, c.z];`);
+  await page.mouse.move(p.x, p.y);
+  await sleep(60);
+  await page.mouse.click(p.x, p.y);
+}
+/** Binary STL → [[x, y, z], ...] (three per triangle), for building test files. */
+function readSTL(path) {
+  const b = Deno.readFileSync(path), v = new DataView(b.buffer, b.byteOffset);
+  const n = v.getUint32(80, true), out = [];
+  for (let i = 0; i < n; i++) {
+    for (let k = 0; k < 3; k++) {
+      const o = 84 + i * 50 + 12 + k * 12;
+      out.push([v.getFloat32(o, true), v.getFloat32(o + 4, true), v.getFloat32(o + 8, true)]);
+    }
+  }
+  return out;
+}
+
+/** Import `path` through the real file input and wait until `name` is loaded. */
+async function importFile(path, name) {
+  await (await page.$('#file')).uploadFile(path);
+  if (name) {
+    await page.waitForFunction((n) => document.getElementById('s-name').textContent === n,
+      { timeout: 60000 }, name);
+  }
+}
+const pickerOpen = () => page.waitForFunction(
+  () => !document.getElementById('picker').hidden, { timeout: 60000 });
+
+/** The overhang face furthest along ±x in world space (spans a drawn wall). */
+const extremeOverhang = (sign) => `(sf) => {
+  const kept = sf.result.kept, g = sf.part.geometry.getAttribute('position');
+  sf.part.updateMatrixWorld();
+  const v = new sf.part.position.constructor();
+  let best = -1, bv = -Infinity;
+  for (let f = 0; f < kept.length; f++) {
+    if (!kept[f]) continue;
+    v.set(0, 0, 0);
+    for (let i = 0; i < 3; i++) {
+      v.x += g.getX(f * 3 + i) / 3; v.y += g.getY(f * 3 + i) / 3; v.z += g.getZ(f * 3 + i) / 3;
+    }
+    sf.part.localToWorld(v);
+    const s = ${sign} * v.x - Math.abs(v.z) * 0.01;
+    if (s > bv) { bv = s; best = f; }
+  }
+  return best; }`;
+
+try {
+  await page.goto(`${base}/?stl=${model}`, { waitUntil: 'load' });
+  await page.waitForFunction(() => window.__sf?.part, { timeout: 30000 });
+  if (!(await page.evaluate(() => !!window.__sf.camera))) {
+    throw new Error('this build has no window.__sf.camera (the harness needs it to aim clicks)');
+  }
+  await snap('loaded');
+
+  await click('rot-x'); await snap('rot-x');
+  await click('rot-y'); await snap('rot-y');
+  await click('fins-toggle'); await snap('fins-on');
+
+  // Remove the fin nearest the camera, then restore it and walk undo/redo.
+  await click('remove-fins-toggle'); await snap('remove-armed');
+  const fin = await screenOf(`
+    const cam = sf.camera.position, t = sf.finTris; let best = null, bd = Infinity;
+    for (let i = 0; i < t.length; i += 3) {
+      const c = [0, 1, 2].map((k) => (t[i][k] + t[i + 1][k] + t[i + 2][k]) / 3);
+      const d = Math.hypot(c[0] - cam.x, c[1] - cam.y, c[2] - cam.z);
+      if (d < bd) { bd = d; best = c; }
+    }
+    return best ?? [0, 0, 0];`);
+  await page.mouse.move(fin.x, fin.y); await sleep(80);
+  await snap('remove-hover');
+  await page.mouse.click(fin.x, fin.y); await snap('removed-one');
+  await page.keyboard.press('Escape'); await snap('remove-esc');
+  await click('restore-fins'); await snap('restored');
+  await page.keyboard.down('Meta'); await page.keyboard.press('z'); await page.keyboard.up('Meta');
+  await snap('undo-restore');
+  await click('redo'); await snap('redo');
+
+  // Options panel.
+  await setVal('material', 'petg'); await snap('petg');
+  await setVal('bed-pad', 'sure'); await snap('pad-sure');
+  await setVal('bed-pad', 'custom'); await snap('pad-custom');
+  await setVal('pad-gap', '0.2', 'input'); await snap('pad-custom-gap');
+  await setVal('bed-pad', 'auto'); await snap('pad-auto');
+  await setVal('tines', false); await snap('tines-off');
+  await setVal('tines', true); await snap('tines-on');
+  await setVal('sway', true); await snap('sway-on');
+  await setVal('sway', false);
+  await setVal('cutout', 'diamond'); await snap('cutout');
+  await setVal('coverage', '80', 'input'); await snap('coverage-80');
+
+  // Draw mode: a wall across the overhang, then clear and its undo.
+  await setVal('fin-mode', 'draw'); await snap('draw-mode');
+  await clickFace(extremeOverhang(1)); await snap('draw-first');
+  await clickFace(extremeOverhang(-1)); await snap('draw-second');
+  await page.keyboard.press('Escape'); await snap('draw-esc');
+  await click('draw-clear'); await snap('draw-clear');
+  await click('undo'); await snap('undo-clear');
+
+  // Back to Auto with the drawn wall layered on, and the "+ Add" augment.
+  await setVal('fin-mode', 'auto'); await snap('auto-with-drawn');
+  await click('augment-toggle'); await snap('augment-on');
+  await click('augment-toggle'); await snap('augment-off');
+
+  // Strength arrow + layer view.
+  await click('load-up'); await snap('load-up');
+  await click('load-right'); await snap('load-right');
+  await click('load-suggest'); await snap('load-suggest');
+  await click('load-clear'); await snap('load-clear');
+  await setVal('show-layers', true); await snap('layers-on');
+
+  // Lay the most camera-facing (-y) face flat, then undo it.
+  await click('lay-face'); await snap('lay-armed');
+  await clickFace(`(sf) => { const n = sf.topo.nrm; let b = 0, bv = -Infinity;
+    for (let f = 0; f < sf.topo.nFaces; f++) { const s = -n[f * 3 + 1]; if (s > bv) { bv = s; b = f; } }
+    return b; }`);
+  await snap('laid');
+  await click('undo'); await snap('undo-lay');
+
+  // Suggest orientation.
+  await click('suggest-orient'); await sleep(1500); await snap('suggest');
+  await page.evaluate(() => document.querySelector('#suggest-list button:nth-child(2)')?.click());
+  await snap('suggest-2');
+  await click('suggest-toggle'); await snap('suggest-collapsed');
+  await click('rot-reset'); await snap('rot-reset');
+
+  // Fins off / on, threshold, build volume, then a run of undos.
+  await click('fins-toggle'); await snap('fins-off');
+  await click('fins-toggle'); await snap('fins-on-again');
+  await setVal('thr', '55', 'input'); await snap('thr-55');
+  await setVal('volume', 'custom'); await snap('vol-custom');
+  await setVal('vx', '100', 'input'); await snap('vol-100');
+  for (let i = 0; i < 6; i++) await click('undo');
+  await snap('undo-x6');
+
+  // Import a second model through the file input while remove mode is armed: the
+  // new part must come in disarmed (rings back, clicks orbit), not stuck until Esc.
+  // Kept LAST so a base without this step still lines up with every step above.
+  const second = model.endsWith('/cone.stl') ? 'lbracket.stl' : 'cone.stl';
+  await click('remove-fins-toggle');
+  await importFile(join(MODELS, second), second);
+  await snap('import-while-armed');
+
+  // STEP with two bodies: the picker opens with the larger pre-ticked; tick the
+  // other too and "Merge 2 & load".
+  await importFile(join(ROOT, 'tests/fixtures/two-bodies.step'));
+  await pickerOpen(); await snap('step-picker');
+  await page.evaluate(() => document.querySelector('#picker-list input:not(:checked)').click());
+  await snap('step-picker-both');
+  await click('picker-load');
+  await page.waitForFunction(() => document.getElementById('s-name').textContent === 'two-bodies.step',
+    { timeout: 60000 });
+  await snap('step-merged');
+
+  // A two-object 3MF: Cancel keeps the current part; importing again and taking
+  // the pre-selected largest loads it. Written with the app's own writer, which
+  // makes ONE object (part + fins as components); the build is rewritten to place
+  // the two meshes as separate items, the way a slicer plate lists them.
+  const { writeThreeMF } = await import(join(ROOT, 'web/threemf.js'));
+  const { unzip, zipStore } = await import(join(ROOT, 'web/zip.js'));
+  const shift = (tris, dx) => tris.map(([x, y, z]) => [x + dx, y, z]);
+  const written = await unzip(new Uint8Array(await writeThreeMF(
+    readSTL(join(MODELS, 'cone.stl')), shift(readSTL(join(MODELS, 'lbracket.stl')), 120),
+    'plate').arrayBuffer()));
+  const entries = [...written].map(([name, data]) => ({ name, data: name.endsWith('.model')
+    ? new TextDecoder().decode(data).replace(/<build>.*<\/build>/s,
+    '<build><item objectid="1"/><item objectid="2"/></build>') : data }));
+  const plate = join(Deno.makeTempDirSync(), 'plate.3mf');
+  Deno.writeFileSync(plate, new Uint8Array(await zipStore(entries).arrayBuffer()));
+  await importFile(plate);
+  await pickerOpen(); await snap('3mf-picker');
+  await click('picker-cancel'); await snap('3mf-cancelled');
+  // A second copy under another name: re-picking the SAME file fires no `change`
+  // on the input (known: the app never clears it), so nothing would happen.
+  const again = join(Deno.makeTempDirSync(), 'plate-again.3mf');
+  Deno.copyFileSync(plate, again);
+  await importFile(again);
+  await pickerOpen();
+  await click('picker-load');
+  await page.waitForFunction(() => document.getElementById('s-name').textContent === 'plate-again.3mf',
+    { timeout: 60000 });
+  await snap('3mf-loaded');
+
+  // Back to a preset build volume (the remembered choice is part of the step),
+  // then every export format, capturing each download's name and byte size.
+  await setVal('volume', '220 × 220 × 250 mm'); await snap('vol-preset');
+  steps.at(-1).stored = await page.evaluate(() => localStorage.getItem('sf.volume'));
+  await page.evaluate(() => {
+    window.__dl = [];
+    const make = URL.createObjectURL;
+    URL.createObjectURL = (b) => { window.__dlSize = b.size; return make.call(URL, b); };
+    HTMLAnchorElement.prototype.click = function () {
+      if (this.download) window.__dl.push({ name: this.download, size: window.__dlSize });
+    };
+  });
+  for (const id of ['export-stl', 'export-3mf', 'export-fins']) {
+    await click('export'); await click(id);
+  }
+  await snap('exported');
+  steps.at(-1).downloads = await page.evaluate(() => window.__dl);
+
+  // Strength arrow edge paths: Suggest-stronger twice (the second lands on "already
+  // about the strongest"), undo brings the load back, and a new part clears it.
+  await click('load-front'); await snap('load-front');
+  await click('load-suggest'); await snap('load-suggest-1');
+  await click('load-suggest'); await snap('load-suggest-2');
+  await click('load-clear'); await click('undo'); await snap('load-undo');
+  await importFile(join(MODELS, 'cone.stl'), 'cone.stl');
+  await snap('load-new-part');
+
+  // Suggest orientation on more shapes (different verdict lines), taking the Best
+  // row, then collapse and re-expand the results.
+  const ranked = () => page.waitForFunction(() => {
+    const b = document.getElementById('suggest-orient');
+    return !b.disabled && b.textContent === 'Suggest orientation';
+  }, { timeout: 60000 });
+  for (const m of ['tube', 'sphere', 'needle']) {
+    await importFile(join(MODELS, `${m}.stl`), `${m}.stl`);
+    await snap(`${m}-loaded`);
+    await click('suggest-orient'); await sleep(100); await ranked(); await snap(`${m}-suggest`);
+  }
+  await importFile(join(MODELS, 'tube.stl'), 'tube.stl');
+  await click('suggest-orient'); await sleep(100); await ranked();
+  await page.evaluate(() => document.querySelector('#suggest-list button')?.click());
+  await snap('suggest-best');
+  await click('suggest-toggle'); await snap('suggest-closed');
+  await click('suggest-toggle'); await snap('suggest-reopened');
+
+  // A manual turn drops the highlighted row (the list stays): a 90° button, a
+  // gizmo ring drag (driven through its own events), then a lay-flat.
+  const pickRow = (n) => page.evaluate((n) =>
+    document.querySelector(`#suggest-list button:nth-child(${n})`)?.click(), n);
+  await pickRow(2); await snap('row-picked');
+  await click('rot-x'); await snap('row-after-rot90');
+  await pickRow(2);
+  await page.evaluate(() => {
+    let g = null;
+    window.__sf.part.parent.traverse((o) => { if (o.isTransformControlsRoot) g = o.controls; });
+    g.dispatchEvent({ type: 'dragging-changed', value: true });
+    window.__sf.part.rotateZ(Math.PI / 6);
+    g.dispatchEvent({ type: 'dragging-changed', value: false });
+  });
+  await snap('row-after-drag');
+  await pickRow(2);
+  await click('lay-face');
+  await clickFace(`(sf) => { const n = sf.topo.nrm; let b = 0, bv = -Infinity;
+    for (let f = 0; f < sf.topo.nFaces; f++) { const s = -n[f * 3 + 1]; if (s > bv) { bv = s; b = f; } }
+    return b; }`);
+  await snap('row-after-lay');
+
+  // Hand-placed supports on a fresh page: with Sway on, one click on an upright
+  // side stands a brace; select a drawn wall and take it out with Remove selected,
+  // then with Delete; a right-click drops a half-drawn wall.
+  await page.goto(`${base}/?stl=${model}`, { waitUntil: 'load' });
+  await page.waitForFunction(() => window.__sf?.part, { timeout: 30000 });
+  await settle();
+  await click('rot-x'); await click('rot-y');
+  await click('fins-toggle'); await settle();
+  await setVal('fin-mode', 'draw'); await settle();
+  await setVal('sway', true);
+  // The biggest upright face turned toward the camera: room for a brace's tines.
+  await clickFace(`(sf) => { const n = sf.topo.nrm, g = sf.part.geometry.getAttribute('position');
+    const q = sf.part.quaternion, cam = sf.camera.position.clone().normalize();
+    const V = cam.constructor, v = new V(), a = new V(), b = new V(), c = new V();
+    let best = 0, bv = -Infinity;
+    for (let f = 0; f < sf.topo.nFaces; f++) {
+      v.set(n[f * 3], n[f * 3 + 1], n[f * 3 + 2]).applyQuaternion(q);
+      if (Math.abs(v.z) > 0.1 || v.dot(cam) < 0.3) continue;
+      a.fromBufferAttribute(g, f * 3); b.fromBufferAttribute(g, f * 3 + 1).sub(a);
+      c.fromBufferAttribute(g, f * 3 + 2).sub(a);
+      const area = b.cross(c).length();
+      if (area > bv) { bv = area; best = f; }
+    }
+    return best; }`);
+  await snap('hand-sway');
+  await setVal('sway', false);
+  await clickFace(extremeOverhang(1));
+  await clickFace(extremeOverhang(-1)); await snap('hand-wall');
+  const wallAt = () => screenOf(`
+    const cam = sf.camera.position, t = sf.drawnTris; let best = null, bd = Infinity;
+    for (let i = 0; i < t.length; i += 3) {
+      const c = [0, 1, 2].map((k) => (t[i][k] + t[i + 1][k] + t[i + 2][k]) / 3);
+      const d = Math.hypot(c[0] - cam.x, c[1] - cam.y, c[2] - cam.z);
+      if (d < bd) { bd = d; best = c; }
+    }
+    return best ?? [0, 0, 0];`);
+  let w = await wallAt();
+  await page.mouse.click(w.x, w.y); await snap('wall-selected');
+  await click('draw-remove'); await snap('wall-removed-button');
+  await click('undo'); await snap('wall-back');
+  w = await wallAt();
+  await page.mouse.click(w.x, w.y);
+  await page.keyboard.press('Delete'); await snap('wall-removed-key');
+  await clickFace(extremeOverhang(1)); await snap('half-wall');
+  const half = await screenOf('return [0, 0, 0];');
+  await page.mouse.click(half.x, half.y, { button: 'right' }); await snap('half-wall-rightclick');
+
+  // Leftover UI: Undo while "Lay a face flat" is armed, then a new part loaded
+  // with lay-flat and "+ Add walls by hand" armed and a Suggest list up. The new
+  // part must come in with every one of those reset.
+  await click('rot-x'); await settle();
+  await click('lay-face'); await snap('lay-armed-before-undo');
+  await click('undo'); await snap('undo-while-lay-armed');
+  await setVal('fin-mode', 'auto'); await settle();
+  await click('suggest-orient'); await sleep(100); await ranked();
+  await click('augment-toggle');
+  await click('lay-face'); await snap('armed-before-load');
+  const other = model.endsWith('/cone.stl') ? 'lbracket.stl' : 'cone.stl';
+  await importFile(join(MODELS, other), other);
+  await snap('load-while-armed');
+} catch (err) {
+  errors.push(`harness: ${err.message}`);
+}
+
+if (args.out) Deno.writeTextFileSync(args.out, JSON.stringify({ model, steps, errors }, null, 1));
+log(`${steps.length} steps, ${errors.length} error(s)${errors.length ? '\n' + errors.join('\n') : ''}`);
+await browser.close();
+await server.shutdown();
+Deno.exit(errors.length ? 1 : 0);

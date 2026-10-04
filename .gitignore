@@ -5,6 +5,31 @@ node_modules/
 dist/
 *.stl
 !tests/fixtures/*.stl
+# calibration coupons exactly as printed (prototype/calibration/README.md)
+!prototype/calibration/*/print/*.stl
+# test models the Deno suite loads (tests/_util.js MODELS); regenerate with
+# prototype/stress/gen.py. Committed so CI and fresh checkouts can run the tests.
 out/
 dev-models/
-prototype/stress/models/
+prototype/stress/models/*
+!prototype/stress/models/*.stl
+plugins/orca/build/
+
+# example models: Thingi10K ones keep third-party licenses, so they're fetched
+# locally (fetch_thingi.py), never committed
+prototype/examples/real/
+# Fusion add-in: its saved settings, VS Code files and the built engine bundle are per machine
+plugins/fusion/SupportFins/settings.json
+plugins/fusion/SupportFins/.env
+plugins/fusion/SupportFins/.vscode/
+plugins/fusion/SupportFins/palette/fins_engine.js
+plugins/fusion/build/
+plugins/cura/build/
+plugins/cli/build/
+plugins/cura/SupportFins/dev_*
+plugins/freecad/build/
+
+# Blender: built extension zips and the cached mini-racer wheels
+plugins/blender/build/
+# user-reported parts (other people's files): measured locally, never committed
+prototype/examples/reports/

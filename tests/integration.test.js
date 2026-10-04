@@ -7,7 +7,7 @@
 // weeks). These tests measure the tines that come out of a full build against the
 // spec, so a regression in width/height/placement shows up on a real part.
 
-import { fins, analyze, loadModel, insideCount, isClosed, rotX, prop, assert } from './_util.js';
+import { fins, analyze, loadModel, insideCount, isClosed, rotX, prop, assert, tineBoxes } from './_util.js';
 
 const { PROP } = prop;
 
@@ -20,10 +20,11 @@ function build(name, tilt, opts = {}) {
 }
 
 // Isolate the tine triangles: whatever a tined build adds over a tine-less one.
-// emitTines appends each tine as a contiguous 36-vertex block, so chunk by 36.
-function tineChunks(name, tilt) {
-  const off = build(name, tilt, { tines: false }).built.triangles;
-  const on = build(name, tilt, { tines: true }).built.triangles;
+// emitTines appends each tine as a contiguous 36-vertex block (and its wall step,
+// when it has one, as the next 36), so chunk by 36; tinesAndSteps tells them apart.
+function tineChunks(name, tilt, opts = {}) {
+  const off = build(name, tilt, { ...opts, tines: false }).built.triangles;
+  const on = build(name, tilt, { ...opts, tines: true }).built.triangles;
   const key = (t) => t.map((v) => v.map((x) => Math.round(x * 1e4)).join(',')).join('|');
   const offKeys = new Set();
   for (let i = 0; i < off.length; i += 3) offKeys.add(key([off[i], off[i + 1], off[i + 2]]));
@@ -36,6 +37,9 @@ function tineChunks(name, tilt) {
   for (let i = 0; i + 36 <= verts.length; i += 36) chunks.push(verts.slice(i, i + 36));
   return chunks;
 }
+
+// Tine boxes and their wall steps (local issue 005), told apart by tineBoxes.
+const tinesAndSteps = (name, tilt, opts = {}) => tineBoxes(tineChunks(name, tilt, opts).flat());
 
 // (model, tilt) pairs that genuinely need support and place it.
 const NEEDS_SUPPORT = [['ramp', 40], ['wedge', 40], ['staircase', 40], ['lbracket', 40]];
@@ -59,17 +63,13 @@ Deno.test('a grippable tilted part gets gripping tines, and the walls never fuse
 });
 
 Deno.test('every tine on a real part matches Slant’s spec: one layer tall, one bead wide', () => {
-  const chunks = tineChunks('ramp', 40);
+  const chunks = tinesAndSteps('ramp', 40).tines;
   assert(chunks.length >= 3, `expected several tines to measure, got ${chunks.length}`);
   // the tine footprint is a rectangle: (bite + overlap) long, tineW wide. Pin the
   // diagonal to THAT -- a th-wide (1.0mm) tine pushes the diagonal from ~0.94 to
   // ~1.28 and trips this. Uses tineW so it tracks the spec, not a loose 0.8.
-  const maxDiag = Math.hypot(PROP.tineBite + PROP.tineOverlap, PROP.tineW) + 0.05;
-  for (const c of chunks) {
-    let lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
-    for (const v of c) for (let k = 0; k < 3; k++) {
-      if (v[k] < lo[k]) lo[k] = v[k]; if (v[k] > hi[k]) hi[k] = v[k];
-    }
+  const maxDiag = Math.hypot(PROP.tineReach + PROP.tineOverlap, PROP.tineW) + 0.05;
+  for (const { lo, hi } of chunks) {
     // one layer tall
     const zExt = hi[2] - lo[2];
     assert(Math.abs(zExt - PROP.tineH) < 1e-4, `a tine is ${zExt.toFixed(3)}mm tall, not one layer (${PROP.tineH})`);
@@ -77,5 +77,22 @@ Deno.test('every tine on a real part matches Slant’s spec: one layer tall, one
     // A th-wide (1.0mm) tine blows past this -- the exact bug this file guards.
     const diag = Math.hypot(hi[0] - lo[0], hi[1] - lo[1]);
     assert(diag <= maxDiag, `a tine's footprint diagonal is ${diag.toFixed(2)}mm (> ${maxDiag.toFixed(2)}) -- wider than one nozzle bead`);
+  }
+});
+
+Deno.test('PETG: a tine snapped above the wall top gets a wall step under it, inside its footprint', () => {
+  // PETG's 0.3 gap is 1.5 layers, so a one-layer tine snapped to the part's layer can
+  // start a full layer above the wall: without the step the slice under it is empty
+  // and the tine hangs off the part, not touching the wall (local issue 005).
+  const { tines, steps } = tinesAndSteps('cone', 30, { tunables: { propGap: 0.3 } });
+  assert(tines.length >= 10, `expected a comb of tines, got ${tines.length}`);
+  assert(steps.length >= tines.length / 4, `only ${steps.length} wall steps for ${tines.length} PETG tines`);
+  for (const st of steps) {
+    const h = st.hi[2] - st.lo[2];
+    // from half a layer inside the wall to half a layer inside the tine: <= 2 layers
+    assert(h > 0 && h <= 2 * PROP.tineH + 1e-6, `a wall step is ${h.toFixed(3)} mm tall (max 2 layers)`);
+    // under the tine, never out past it toward the part: tinesAndSteps only counts a
+    // box as a step when it lies inside its tine's footprint, so a stray one would
+    // land in `tines` and fail the one-layer check in the test above.
   }
 });
