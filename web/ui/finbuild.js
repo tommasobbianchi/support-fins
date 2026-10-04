@@ -121,7 +121,16 @@ export function swayOpts() {
 }
 
 function makeFinWorker() {
-  const w = new Worker(new URL('../finworker.js', import.meta.url), { type: 'module' });
+  let w;
+  if (typeof window !== 'undefined' && typeof window.__SF_FINWORKER__ === 'string') {
+    // Dock-panel build: finworker.js can't be fetched, so the plugin inlines the
+    // worker SOURCE as a string. A blob URL gives the worker a valid script URL;
+    // it is CLASSIC (no type:"module") because the inlined source must be
+    // self-contained -- no imports.
+    w = new Worker(URL.createObjectURL(new Blob([window.__SF_FINWORKER__], { type: 'text/javascript' })));
+  } else {
+    w = new Worker(new URL('../finworker.js', import.meta.url), { type: 'module' });
+  }
   w.onmessage = (e) => {
     if (e.data.id !== finGen) return;              // a newer pose already superseded this build
     finBusy = false;

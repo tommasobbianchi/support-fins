@@ -22,7 +22,7 @@ import {
   removeActive, cancelRemove, clearFinHover, hoverRemove, clickRemove,
 } from './ui/remove.js';
 import { undo, redo } from './ui/history.js';
-import { loadURL } from './ui/io.js';
+import { loadURL, parseModel } from './ui/io.js';
 import { writeBinarySTL } from './stl.js';
 import { applyVolume, setVolume } from './ui/volume.js';
 import { buildExportGeometry } from './ui/export.js';
@@ -34,7 +34,7 @@ import {
 } from './ui/walls.js';
 import { finTris, padTris, lastBuilt } from './ui/finbuild.js';
 import { initSettings, applyMaterial } from './ui/settings.js';
-import { part, topology, rotM3, lastResult, threshold } from './ui/part.js';
+import { part, setPart, topology, rotM3, lastResult, threshold } from './ui/part.js';
 import { gizmo, hoverFace, layActive, cancelLay, layHover, layClick } from './ui/pose.js';
 
 // ------------------------------------------------------------------ keyboard
@@ -185,29 +185,44 @@ const wanted = params.get('stl');
 if (wanted) loadURL(wanted).catch((err) => console.error('?stl=', err));
 
 // ------------------------------------------------------------ OrcaSlicer mode
-// ?orca is set by the OrcaSlicer plugin (orca-plugin/support_fins.py), which
-// serves this app from a loopback server inside Orca. The part arrives as it sits
-// on Orca's plate, the slicer's layer height / filament / bed seed the controls,
-// and "Send to OrcaSlicer" posts the finned STL back for the plugin to load.
-if (params.has('orca')) initOrca().catch((err) => alert(`OrcaSlicer: ${err.message}`));
+// Inside OrcaSlicer this same app runs in a dock panel: there is no URL and no
+// network, only window.orca (orca.onMessage / orca.postMessage). The part comes
+// from the plate as base64 binary STL, the slicer's layer height / filament /
+// bed seed the controls, and "Send to OrcaSlicer" posts the finned STL back for
+// the plugin to load. On the web (no window.orca) this whole block is inert.
+if (window.orca && typeof window.orca.onMessage === 'function') {
+  window.orca.onMessage((msg) => {
+    if (msg.command === 'session') initOrca(msg.session, msg.objects)
+      .catch((err) => alert(`OrcaSlicer: ${err.message}`));
+    else if (msg.command === 'loaded') {
+      const send = el('to-orca');
+      send.disabled = false;               // the reply to "Send to OrcaSlicer"
+      alert(msg.detail);
+    }
+  });
+}
 
-async function initOrca() {
-  const s = await (await fetch('/orca/session')).json();
-  if (s.layer_height) el('layer-height').value = s.layer_height;
-  if (s.material) {
-    el('material').value = s.material;
-    applyMaterial(s.material);
+async function initOrca(session, objects) {
+  if (session.layer_height) el('layer-height').value = session.layer_height;
+  if (session.material) {
+    el('material').value = session.material;
+    applyMaterial(session.material);
   }
-  if (s.volume) setVolume(s.volume[0], s.volume[1], s.volume[2]);
-  if (!s.objects.length) throw new Error('the plate is empty -- add a part first');
+  if (session.volume) setVolume(session.volume[0], session.volume[1], session.volume[2]);
+  if (!objects.length) throw new Error('the plate is empty -- add a part first');
 
   const pick = el('orca-object');
-  s.objects.forEach((o, i) => pick.add(new Option(o.name, String(i))));
-  pick.hidden = s.objects.length < 2;
-  // the last path segment is what loadURL names the part, so give it the Orca name
-  const load = () => loadURL(
-    `/orca/mesh/${pick.value}/${encodeURIComponent(s.objects[Number(pick.value)].name)}.stl`);
-  pick.addEventListener('change', load);
+  pick.replaceChildren();
+  objects.forEach((o, i) => pick.add(new Option(o.name, String(i))));
+  pick.hidden = objects.length < 2;
+  // decode the object's base64 and parse it straight -- no fetch, no File.
+  const load = async () => {
+    const o = objects[Number(pick.value)];
+    const geometry = await parseModel(b64Bytes(o.stl).buffer);
+    if (!geometry) throw new Error(`could not read "${o.name}"`);
+    setPart(geometry, o.name);
+  };
+  pick.onchange = load;                    // a re-run overwrites the previous handler
   await load();
 
   // the part comes from the plate and goes back to it: no file open, no 3MF export
@@ -220,21 +235,38 @@ async function initOrca() {
   badge.title = 'Support Fins by Matthew Trahan (github.com/gittrahan/support-fins). '
     + 'Designed-in support fins are Slant 3D\'s technique. OrcaSlicer port by Tommaso Bianchi.';
   const send = el('to-orca');
+  if (send.__orcaBound) { send.hidden = false; return; }   // a re-run: listener already armed
+  send.__orcaBound = true;
   send.hidden = false;
   send.addEventListener('click', async () => {
     const g = buildExportGeometry();
     if (!g) return;
     send.disabled = true;
     try {
-      const res = await fetch(`/orca/result?name=${encodeURIComponent(g.base)}`, {
-        method: 'POST', body: writeBinarySTL([...g.partTris, ...g.finTris], g.base) });
-      const msg = await res.text();
-      if (!res.ok) throw new Error(msg);
-      alert(msg);
+      const blob = writeBinarySTL([...g.partTris, ...g.finTris], g.base);
+      const buf = await blob.arrayBuffer();
+      orca.postMessage({ command: 'result', name: g.base, b64: bytesB64(new Uint8Array(buf)) });
     } catch (err) {
       alert(`Could not send to OrcaSlicer: ${err.message}`);
-    } finally {
       send.disabled = false;
     }
+    // the button re-enables on {command:"loaded"} -- the reply to the send.
   });
 }
+
+// base64 <-> bytes the message schema wants. Chunked: spreading or joining a
+// multi-MB buffer as one string would overflow.
+function b64Bytes(s) {
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function bytesB64(bytes) {
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    out += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(out);
+}
+const orca = window.orca;   // the bridge handle for the dock-panel host
